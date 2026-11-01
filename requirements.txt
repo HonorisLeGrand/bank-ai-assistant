@@ -1,0 +1,7 @@
+ollama
+python-dotenv
+google-genai
+tiktoken
+qdrant-client
+sentence-transformers
+pypdf
