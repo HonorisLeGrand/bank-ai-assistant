@@ -1,8 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { 
   Sparkles, Send, Bot, User, ShieldCheck, 
-  BookOpen, Building2, ChevronRight, CheckCircle, 
-  Database, Cpu, MessageSquare 
+  BookOpen, ChevronRight, CheckCircle, 
+  Database, Cpu, MessageSquare, Phone, MapPin,
+  Mic, MicOff, Volume2, Square
 } from './Icons';
 
 export default function App() {
@@ -10,19 +11,28 @@ export default function App() {
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
-      content: "Bonjour et bienvenue sur **BANCOBU AI**, votre conseiller bancaire intelligent de nouvelle génération. Comment puis-je vous éclairer aujourd'hui concernant les offres, comptes ou services de la BANCOBU ?",
+      content: "Bonjour et bienvenue sur **BANCOBU AI**, votre conseiller bancaire intelligent officiel.\n\nJe suis à votre disposition pour vous renseigner avec précision sur nos comptes, nos cartes bancaires, nos offres d'épargne ou encore nos crédits, certifiés conformes par la documentation officielle de la BANCOBU.\n\nVous pouvez me poser votre question par écrit ou **directement à la voix en cliquant sur le micro** !",
       sources: []
     }
   ]);
   const [inputQuestion, setInputQuestion] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [autoPlayAudio, setAutoPlayAudio] = useState(true);
+  const [playingIndex, setPlayingIndex] = useState(null);
+
   const messagesEndRef = useRef(null);
+  const recognitionRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const audioPlayerRef = useRef(null);
 
   const suggestedQuestions = [
-    "Quelles sont les conditions d'ouverture d'un compte courant ?",
-    "Comment fonctionne le service BANCOBU Diaspora ?",
-    "Quels sont les avantages d'un compte épargne ?",
-    "Quelles pièces justificatives fournir pour un prêt ?"
+    "Conditions compte courant ?",
+    "Service BANCOBU Diaspora ?",
+    "Avantages compte KIRA MAMA ?",
+    "Carte Visa prépayée ?"
   ];
 
   const scrollToBottom = () => {
@@ -31,11 +41,211 @@ export default function App() {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, isLoading]);
+  }, [messages, isLoading, isTranscribing]);
+
+  // Initialisation du module Speech-To-Text Web Speech API (fallback navigateur)
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      try {
+        const recognition = new SpeechRecognition();
+        recognition.continuous = false;
+        recognition.interimResults = false;
+        recognition.lang = 'fr-FR';
+
+        recognition.onresult = (event) => {
+          const transcript = event.results[0][0].transcript;
+          if (transcript) {
+            setInputQuestion(transcript);
+            handleSend(transcript);
+          }
+        };
+
+        recognition.onerror = (event) => {
+          console.warn("SpeechRecognition avertissement:", event.error);
+          setIsRecording(false);
+        };
+
+        recognition.onend = () => {
+          setIsRecording(false);
+        };
+
+        recognitionRef.current = recognition;
+      } catch (e) {
+        console.warn("SpeechRecognition init error:", e);
+      }
+    }
+  }, []);
+
+  // Déclencher ou arrêter l'enregistrement audio
+  const toggleRecording = async () => {
+    if (isRecording) {
+      stopRecording();
+      return;
+    }
+
+    // 1. Priorité à la reconnaissance native ultra-rapide (détection automatique de fin de parole)
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.start();
+        setIsRecording(true);
+        return;
+      } catch (e) {
+        console.warn("SpeechRecognition start échec, bascule MediaRecorder:", e);
+      }
+    }
+
+    // 2. Alternative MediaRecorder (capture et transcription serveur)
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      await startMediaRecording();
+      return;
+    }
+
+    alert("Veuillez autoriser l'accès au microphone dans votre navigateur.");
+  };
+
+  const startMediaRecording = async () => {
+    audioChunksRef.current = [];
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      
+      let mimeType = '';
+      if (typeof MediaRecorder !== 'undefined') {
+        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+          mimeType = 'audio/webm;codecs=opus';
+        } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+          mimeType = 'audio/webm';
+        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+          mimeType = 'audio/mp4';
+        }
+      }
+
+      const options = mimeType ? { mimeType } : undefined;
+      const recorder = new MediaRecorder(stream, options);
+
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        stream.getTracks().forEach(track => track.stop());
+        if (audioChunksRef.current.length > 0) {
+          const actualMime = recorder.mimeType || 'audio/webm';
+          const audioBlob = new Blob(audioChunksRef.current, { type: actualMime });
+          await sendAudioForTranscription(audioBlob);
+        }
+      };
+
+      recorder.start();
+      mediaRecorderRef.current = recorder;
+      setIsRecording(true);
+      return;
+    } catch (err) {
+      console.warn("Échec getUserMedia :", err);
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        alert("Vous avez refusé l'accès au microphone. Cliquez sur l'icône de cadenas/paramètres dans la barre d'adresse pour autoriser le micro.");
+      } else {
+        alert("Impossible de démarrer l'enregistrement : " + (err.message || "Erreur microphone"));
+      }
+      setIsRecording(false);
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (e) {
+        console.warn(e);
+      }
+    }
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {
+        console.warn(e);
+      }
+    }
+    setIsRecording(false);
+  };
+
+  // Envoi du blob audio au serveur FastAPI pour transcription Gemini
+  const sendAudioForTranscription = async (blob) => {
+    setIsTranscribing(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', blob, 'audio_prompt.webm');
+
+      const response = await fetch('/api/transcribe', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error("Erreur serveur lors de la transcription");
+      }
+
+      const data = await response.json();
+      const transcribedText = data.transcript?.trim();
+
+      if (transcribedText) {
+        setInputQuestion(transcribedText);
+        handleSend(transcribedText);
+      } else {
+        alert("Aucune parole audible détectée. Veuillez parler plus près du micro.");
+      }
+    } catch (err) {
+      console.error("Erreur transcription vocale:", err);
+      alert("Erreur lors de la transcription vocale. Vous pouvez également poser votre question par écrit.");
+    } finally {
+      setIsTranscribing(false);
+    }
+  };
+
+  // Jouer la synthèse vocale d'un message
+  const playTTS = async (text, msgIndex) => {
+    try {
+      if (playingIndex === msgIndex) {
+        audioPlayerRef.current?.pause();
+        setPlayingIndex(null);
+        return;
+      }
+
+      setPlayingIndex(msgIndex);
+      const response = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text })
+      });
+
+      if (!response.ok) throw new Error("Erreur génération audio");
+
+      const blob = await response.blob();
+      const audioUrl = URL.createObjectURL(blob);
+
+      if (audioPlayerRef.current) {
+        audioPlayerRef.current.src = audioUrl;
+        audioPlayerRef.current.play();
+        audioPlayerRef.current.onended = () => {
+          setPlayingIndex(null);
+        };
+      }
+    } catch (err) {
+      console.error("Erreur lecture audio :", err);
+      setPlayingIndex(null);
+    }
+  };
 
   const handleSend = async (questionText) => {
     const query = questionText || inputQuestion;
     if (!query.trim() || isLoading) return;
+
+    if (isRecording) {
+      stopRecording();
+    }
 
     const userMessage = { role: 'user', content: query };
     setMessages((prev) => [...prev, userMessage]);
@@ -43,7 +253,7 @@ export default function App() {
     setIsLoading(true);
 
     try {
-      const response = await fetch('http://localhost:8000/api/ask', {
+      const response = await fetch('/api/ask', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: query })
@@ -56,14 +266,20 @@ export default function App() {
         throw new Error(errorDetail);
       }
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: data.answer,
-          sources: data.sources || []
+      const newMsg = {
+        role: 'assistant',
+        content: data.answer,
+        sources: data.sources || []
+      };
+
+      setMessages((prev) => {
+        const updated = [...prev, newMsg];
+        if (autoPlayAudio) {
+          playTTS(data.answer, updated.length - 1);
         }
-      ]);
+        return updated;
+      });
+
     } catch (err) {
       setMessages((prev) => [
         ...prev,
@@ -80,252 +296,288 @@ export default function App() {
   };
 
   return (
-    <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
-      {/* Top Header / Navigation */}
-      <header className="glass" style={{ position: 'sticky', top: 0, zIndex: 50, borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-        <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '16px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', cursor: 'pointer' }} onClick={() => setActiveTab('presentation')}>
-            <div style={{ background: 'linear-gradient(135deg, #0284c7, #2563eb)', padding: '10px', borderRadius: '12px', display: 'flex' }}>
-              <Building2 size={24} style={{ color: '#fff' }} />
-            </div>
-            <div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span style={{ fontWeight: 800, fontSize: '1.25rem', letterSpacing: '-0.5px' }}>BANCOBU</span>
-                <span style={{ fontSize: '0.75rem', background: 'rgba(2,132,199,0.2)', color: '#38bdf8', padding: '2px 8px', borderRadius: '20px', border: '1px solid rgba(56,189,248,0.3)', fontWeight: 600 }}>AI RAG</span>
+    <div className="app-container">
+      
+      {/* Audio player invisible */}
+      <audio ref={audioPlayerRef} style={{ display: 'none' }} />
+
+      {/* 1. TOP BAR BANCOBU VERTE (#4ba452) */}
+      <div style={{ backgroundColor: '#4ba452', color: '#ffffff', fontSize: '0.8rem', padding: '5px 0', borderBottom: '1px solid rgba(0,0,0,0.05)' }}>
+        <div className="top-bar-inner">
+          <div style={{ display: 'flex', gap: '14px', alignItems: 'center' }}>
+            <span style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600 }}>
+              <Phone size={13} /> +257 22 26 52 00
+            </span>
+            <span className="top-bar-location" style={{ display: 'flex', alignItems: 'center', gap: '6px', opacity: 0.9 }}>
+              <MapPin size={13} /> Bujumbura, Burundi
+            </span>
+          </div>
+          <div style={{ display: 'flex', gap: '12px', alignItems: 'center', fontWeight: 600 }}>
+            {/* Toggle Voix automatique */}
+            <label style={{ display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer', background: 'rgba(0,0,0,0.18)', padding: '2px 8px', borderRadius: '12px' }}>
+              <input 
+                type="checkbox" 
+                checked={autoPlayAudio} 
+                onChange={(e) => setAutoPlayAudio(e.target.checked)} 
+                style={{ cursor: 'pointer' }}
+              />
+              <Volume2 size={12} />
+              <span style={{ fontSize: '0.72rem' }}>Voix auto</span>
+            </label>
+            <span className="top-bar-hub" style={{ opacity: 0.9 }}>Digital Hub</span>
+          </div>
+        </div>
+      </div>
+
+      {/* 2. HEADER PRINCIPAL BLANC AVEC LOGO OFFICIEL */}
+      <header style={{ backgroundColor: '#ffffff', borderBottom: '1px solid #e2e8f0', boxShadow: '0 2px 10px rgba(0,0,0,0.04)', position: 'sticky', top: 0, zIndex: 50 }}>
+        <div className="header-inner">
+          
+          {/* Logo & Titre */}
+          <div className="header-brand-wrap" onClick={() => setActiveTab('demo')} style={{ cursor: 'pointer' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <img 
+                src="/Bancobu_Logo.png" 
+                alt="Logo BANCOBU" 
+                className="header-logo-img"
+                onError={(e) => {
+                  e.currentTarget.style.display = 'none';
+                }}
+              />
+              <div style={{ borderLeft: '2px solid #e2e8f0', paddingLeft: '10px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{ fontWeight: 800, fontSize: '1.15rem', color: '#2d3748', letterSpacing: '-0.5px' }}>BANCOBU</span>
+                  <span style={{ fontSize: '0.68rem', backgroundColor: '#eef7ee', color: '#4ba452', padding: '1px 6px', borderRadius: '10px', border: '1px solid #c2e2c4', fontWeight: 700 }}>
+                    IA & VOIX
+                  </span>
+                </div>
+                <p className="header-title-sub">Banque Commerciale du Burundi</p>
               </div>
-              <p style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Banque Commerciale du Burundi — Assistant Intelligent</p>
             </div>
           </div>
 
-          {/* Navigation Tabs */}
-          <nav style={{ display: 'flex', gap: '8px', background: 'rgba(255,255,255,0.05)', padding: '4px', borderRadius: '12px' }}>
-            <button
-              onClick={() => setActiveTab('presentation')}
-              style={{
-                padding: '8px 18px',
-                borderRadius: '8px',
-                border: 'none',
-                cursor: 'pointer',
-                fontWeight: 600,
-                fontSize: '0.9rem',
-                color: activeTab === 'presentation' ? '#fff' : '#94a3b8',
-                background: activeTab === 'presentation' ? 'linear-gradient(135deg, #0284c7, #2563eb)' : 'transparent',
-                transition: 'all 0.2s ease'
-              }}
-            >
-              Présentation & Innovation
-            </button>
+          {/* Onglets de navigation */}
+          <nav className="header-nav">
             <button
               onClick={() => setActiveTab('demo')}
+              className="nav-btn"
               style={{
-                padding: '8px 18px',
-                borderRadius: '8px',
-                border: 'none',
-                cursor: 'pointer',
-                fontWeight: 600,
-                fontSize: '0.9rem',
-                color: activeTab === 'demo' ? '#fff' : '#94a3b8',
-                background: activeTab === 'demo' ? 'linear-gradient(135deg, #0284c7, #2563eb)' : 'transparent',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '6px',
-                transition: 'all 0.2s ease'
+                border: activeTab === 'demo' ? '2px solid #0080fe' : '1px solid #e2e8f0',
+                color: activeTab === 'demo' ? '#ffffff' : '#4a5568',
+                backgroundColor: activeTab === 'demo' ? '#0080fe' : '#ffffff',
+                boxShadow: activeTab === 'demo' ? '0 4px 12px rgba(0, 128, 254, 0.25)' : 'none',
               }}
             >
-              <Sparkles size={16} /> Tester l'Assistant
+              <Sparkles size={14} /> Conseiller Vocal
+            </button>
+            <button
+              onClick={() => setActiveTab('presentation')}
+              className="nav-btn"
+              style={{
+                border: activeTab === 'presentation' ? '2px solid #4ba452' : '1px solid #e2e8f0',
+                color: activeTab === 'presentation' ? '#ffffff' : '#4a5568',
+                backgroundColor: activeTab === 'presentation' ? '#4ba452' : '#ffffff',
+                boxShadow: activeTab === 'presentation' ? '0 4px 12px rgba(75, 164, 82, 0.25)' : 'none',
+              }}
+            >
+              Présentation
             </button>
           </nav>
         </div>
       </header>
 
-      {/* Main Content */}
-      <main style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+      {/* 3. CORPS DE PAGE */}
+      <main style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
         {activeTab === 'presentation' ? (
-          /* ================= PRESENTATION & INNOVATION SHOWCASE ================= */
-          <div style={{ maxWidth: '1100px', margin: '0 auto', padding: '48px 24px', width: '100%' }}>
-            {/* Hero Section */}
-            <section style={{ textAlign: 'center', marginBottom: '64px' }}>
-              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '6px 16px', borderRadius: '999px', background: 'rgba(2, 132, 199, 0.15)', border: '1px solid rgba(56, 189, 248, 0.3)', marginBottom: '24px' }}>
-                <Sparkles size={16} style={{ color: '#38bdf8' }} />
-                <span style={{ fontSize: '0.85rem', color: '#bae6fd', fontWeight: 600 }}>L'Innovation Bancaire par IA Souveraine</span>
+          /* ================= PRESENTATION & INNOVATION ================= */
+          <div style={{ maxWidth: '1140px', margin: '0 auto', padding: '30px 16px', width: '100%' }}>
+            
+            {/* Bannière Hero Style BANCOBU */}
+            <div className="presentation-hero" style={{ backgroundColor: '#ffffff', borderRadius: '16px', padding: '40px 30px', boxShadow: '0 4px 20px rgba(0,0,0,0.05)', border: '1px solid #e2e8f0', marginBottom: '30px', textAlign: 'center' }}>
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '5px 14px', borderRadius: '20px', backgroundColor: '#eef7ee', color: '#4ba452', border: '1px solid #c2e2c4', fontWeight: 700, fontSize: '0.82rem', marginBottom: '16px' }}>
+                <Sparkles size={14} /> Innovation Bancaire : Voix & IA RAG
               </div>
-              <h1 style={{ fontSize: '3rem', fontWeight: 800, lineHeight: 1.15, marginBottom: '20px', letterSpacing: '-1px' }}>
-                L'Intelligence Artificielle au Service de la <br />
-                <span style={{ background: 'linear-gradient(90deg, #38bdf8, #818cf8)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
-                  Relation Client BANCOBU
-                </span>
+              <h1 className="presentation-title" style={{ fontSize: '2.2rem', fontWeight: 800, color: '#1a202c', marginBottom: '14px', lineHeight: 1.25 }}>
+                L'Intelligence Artificielle & la Voix au Cœur de la <br />
+                <span style={{ color: '#4ba452' }}>Relation Client BANCOBU</span>
               </h1>
-              <p style={{ fontSize: '1.2rem', color: '#94a3b8', maxWidth: '750px', margin: '0 auto 36px', lineHeight: 1.6 }}>
-                Fini les réponses vagues ou approximatives. Notre moteur combine la puissance d'embeddings locaux avec la finesse de <strong>Gemini</strong> pour offrir des réponses bancaires fiables, traçables et certifiées par les documents officiels.
+              <p className="presentation-desc" style={{ fontSize: '1.05rem', color: '#4a5568', maxWidth: '750px', margin: '0 auto 24px', lineHeight: 1.6 }}>
+                Posez vos questions à la voix ou par écrit, et écoutez les réponses naturelles d'un conseiller virtuel, certifiées et sourcées à partir de la documentation officielle de la BANCOBU.
               </p>
-              <div style={{ display: 'flex', justifyContent: 'center', gap: '16px' }}>
+              <div style={{ display: 'flex', justifyContent: 'center' }}>
                 <button
                   onClick={() => setActiveTab('demo')}
-                  className="glow-btn"
                   style={{
-                    padding: '14px 32px',
-                    borderRadius: '12px',
+                    backgroundColor: '#4ba452',
+                    color: '#ffffff',
                     border: 'none',
-                    color: '#fff',
+                    padding: '12px 24px',
+                    borderRadius: '8px',
                     fontWeight: 700,
-                    fontSize: '1rem',
+                    fontSize: '0.95rem',
                     cursor: 'pointer',
-                    display: 'flex',
+                    boxShadow: '0 6px 18px rgba(75, 164, 82, 0.35)',
+                    display: 'inline-flex',
                     alignItems: 'center',
-                    gap: '10px'
+                    gap: '8px'
                   }}
                 >
-                  <MessageSquare size={18} />
-                  Démarrer une conversation
+                  <Mic size={17} />
+                  Parler avec le conseiller
                 </button>
               </div>
-            </section>
+            </div>
 
-            {/* Architecture RAG Highlighting */}
-            <section style={{ marginBottom: '64px' }}>
-              <div style={{ textAlign: 'center', marginBottom: '36px' }}>
-                <h2 style={{ fontSize: '1.8rem', fontWeight: 700, marginBottom: '8px' }}>Comment Fonctionne Notre Innovation RAG ?</h2>
-                <p style={{ color: '#94a3b8' }}>Une chaîne technologique rigoureuse garantissant 0 hallucination</p>
+            {/* Grille Piliers Technologiques */}
+            <div style={{ marginBottom: '30px' }}>
+              <div style={{ textAlign: 'center', marginBottom: '24px' }}>
+                <h2 style={{ fontSize: '1.4rem', fontWeight: 700, color: '#2d3748' }}>Une Chaîne Technologique Complète</h2>
+                <p style={{ color: '#718096', fontSize: '0.9rem' }}>De la reconnaissance vocale à la synthèse audio haute fidélité</p>
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '20px' }}>
-                <div className="glass" style={{ padding: '24px', borderRadius: '16px' }}>
-                  <div style={{ width: '48px', height: '48px', borderRadius: '12px', background: 'rgba(2, 132, 199, 0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '16px' }}>
-                    <BookOpen size={24} style={{ color: '#38bdf8' }} />
+              <div className="tech-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '16px' }}>
+                <div style={{ backgroundColor: '#ffffff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0', boxShadow: '0 2px 8px rgba(0,0,0,0.03)' }}>
+                  <div style={{ width: '40px', height: '40px', borderRadius: '8px', backgroundColor: '#eef7ee', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '14px' }}>
+                    <Mic size={20} style={{ color: '#4ba452' }} />
                   </div>
-                  <h3 style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: '8px' }}>1. Ingestion Certifiée</h3>
-                  <p style={{ fontSize: '0.9rem', color: '#94a3b8', lineHeight: 1.5 }}>
-                    Extraction et découpage intelligent de la documentation officielle BANCOBU en respectant la structure des offres.
+                  <h3 style={{ fontSize: '1rem', fontWeight: 700, color: '#2d3748', marginBottom: '6px' }}>1. Entrée Vocale Omnicanale</h3>
+                  <p style={{ fontSize: '0.85rem', color: '#718096', lineHeight: 1.5 }}>
+                    Transcrit la parole instantanément depuis PC, tablette ou smartphone.
                   </p>
                 </div>
 
-                <div className="glass" style={{ padding: '24px', borderRadius: '16px' }}>
-                  <div style={{ width: '48px', height: '48px', borderRadius: '12px', background: 'rgba(16, 185, 129, 0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '16px' }}>
-                    <Database size={24} style={{ color: '#34d399' }} />
+                <div style={{ backgroundColor: '#ffffff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0', boxShadow: '0 2px 8px rgba(0,0,0,0.03)' }}>
+                  <div style={{ width: '40px', height: '40px', borderRadius: '8px', backgroundColor: '#ebf8ff', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '14px' }}>
+                    <Database size={20} style={{ color: '#0080fe' }} />
                   </div>
-                  <h3 style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: '8px' }}>2. Recherche Sémantique Qdrant</h3>
-                  <p style={{ fontSize: '0.9rem', color: '#94a3b8', lineHeight: 1.5 }}>
-                    Vectorisation avec <em>embeddinggemma</em> et indexation vectorielle haute vitesse pour retrouver le bon paragraphe en millisecondes.
+                  <h3 style={{ fontSize: '1rem', fontWeight: 700, color: '#2d3748', marginBottom: '6px' }}>2. Recherche Sémantique Qdrant</h3>
+                  <p style={{ fontSize: '0.85rem', color: '#718096', lineHeight: 1.5 }}>
+                    Localise les articles exacts dans <code>bancobu_donnees.pdf</code> en quelques millisecondes.
                   </p>
                 </div>
 
-                <div className="glass" style={{ padding: '24px', borderRadius: '16px' }}>
-                  <div style={{ width: '48px', height: '48px', borderRadius: '12px', background: 'rgba(139, 92, 246, 0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '16px' }}>
-                    <Cpu size={24} style={{ color: '#a78bfa' }} />
+                <div style={{ backgroundColor: '#ffffff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0', boxShadow: '0 2px 8px rgba(0,0,0,0.03)' }}>
+                  <div style={{ width: '40px', height: '40px', borderRadius: '8px', backgroundColor: '#fffaf0', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '14px' }}>
+                    <Cpu size={20} style={{ color: '#de6906' }} />
                   </div>
-                  <h3 style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: '8px' }}>3. Raisonnement Gemini</h3>
-                  <p style={{ fontSize: '0.9rem', color: '#94a3b8', lineHeight: 1.5 }}>
-                    Synthèse naturelle par le modèle de Google guidé par des consignes strictes de conformité bancaire et de neutralité.
+                  <h3 style={{ fontSize: '1rem', fontWeight: 700, color: '#2d3748', marginBottom: '6px' }}>3. Raisonnement Gemini</h3>
+                  <p style={{ fontSize: '0.85rem', color: '#718096', lineHeight: 1.5 }}>
+                    Rédige une réponse claire, polie et certifiée respectant les directives bancaires.
                   </p>
                 </div>
 
-                <div className="glass" style={{ padding: '24px', borderRadius: '16px' }}>
-                  <div style={{ width: '48px', height: '48px', borderRadius: '12px', background: 'rgba(245, 158, 11, 0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '16px' }}>
-                    <ShieldCheck size={24} style={{ color: '#fbbf24' }} />
+                <div style={{ backgroundColor: '#ffffff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0', boxShadow: '0 2px 8px rgba(0,0,0,0.03)' }}>
+                  <div style={{ width: '40px', height: '40px', borderRadius: '8px', backgroundColor: '#eef7ee', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '14px' }}>
+                    <Volume2 size={20} style={{ color: '#4ba452' }} />
                   </div>
-                  <h3 style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: '8px' }}>4. Traçabilité Totale</h3>
-                  <p style={{ fontSize: '0.9rem', color: '#94a3b8', lineHeight: 1.5 }}>
-                    Chaque réponse indique explicitement les numéros de page originaux consultés pour une conformité et vérification immédiate.
+                  <h3 style={{ fontSize: '1rem', fontWeight: 700, color: '#2d3748', marginBottom: '6px' }}>4. Voix Neuronale Naturelle</h3>
+                  <p style={{ fontSize: '0.85rem', color: '#718096', lineHeight: 1.5 }}>
+                    Génération audio MP3 fluide avec voix de conseiller francophone naturelle (Edge-TTS).
                   </p>
                 </div>
               </div>
-            </section>
+            </div>
 
-            {/* Key Benefits */}
-            <section className="glass" style={{ padding: '40px', borderRadius: '24px', border: '1px solid rgba(2, 132, 199, 0.3)' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '32px', alignItems: 'center' }}>
-                <div>
-                  <h2 style={{ fontSize: '2rem', fontWeight: 700, marginBottom: '16px' }}>Une Expérience Client Révolutionnée</h2>
-                  <p style={{ color: '#94a3b8', lineHeight: 1.6, marginBottom: '24px' }}>
-                    Offrez à vos clients et collaborateurs une assistance 24/7 capable de répondre instantanément aux demandes les plus pointues : comptes devises, crédits, diaspora et formalités administratives.
-                  </p>
-                  <ul style={{ listStyle: 'none', display: 'flex', flexDirection: 'column', gap: '14px' }}>
-                    {[
-                      "Réduction drastique des temps d'attente en agence et au centre d'appel",
-                      "Élimination des erreurs d'information sur les frais et conditions",
-                      "Support bilingue et omnicanal adaptable au web, mobile et WhatsApp",
-                      "Sécurité et confidentialité des données bancaires garanties"
-                    ].map((benefit, i) => (
-                      <li key={i} style={{ display: 'flex', alignItems: 'center', gap: '12px', fontSize: '0.95rem' }}>
-                        <CheckCircle size={18} style={{ color: '#34d399', flexShrink: 0 }} />
-                        <span>{benefit}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-                <div style={{ textAlign: 'center' }}>
-                  <div style={{ background: 'rgba(2, 132, 199, 0.08)', padding: '32px', borderRadius: '20px', border: '1px dashed rgba(56, 189, 248, 0.4)' }}>
-                    <span style={{ fontSize: '3rem', fontWeight: 800, color: '#38bdf8' }}>100%</span>
-                    <p style={{ fontWeight: 600, fontSize: '1.1rem', margin: '8px 0 4px' }}>Ancré dans vos sources</p>
-                    <p style={{ fontSize: '0.85rem', color: '#94a3b8' }}>Les réponses sont strictement extraites de bancobu_donnees.pdf</p>
-                  </div>
-                </div>
-              </div>
-            </section>
           </div>
         ) : (
-          /* ================= INTERACTIVE CHAT UI ================= */
-          <div style={{ flex: 1, maxWidth: '1000px', margin: '0 auto', width: '100%', padding: '24px 20px', display: 'flex', flexDirection: 'column', height: 'calc(100vh - 85px)' }}>
+          /* ================= CHATBOT BANCOBU AVEC AUDIO & MICRO ================= */
+          <div className="chat-container">
             
-            {/* Messages Area */}
-            <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '20px', paddingRight: '8px' }}>
+            {/* Zone de discussion */}
+            <div className="chat-messages">
               {messages.map((msg, index) => {
                 const isAssistant = msg.role === 'assistant';
+                const isPlaying = playingIndex === index;
+
                 return (
                   <div 
                     key={index} 
+                    className="msg-row"
                     style={{ 
-                      display: 'flex', 
-                      gap: '14px', 
-                      alignItems: 'flex-start',
-                      alignSelf: isAssistant ? 'flex-start' : 'flex-end',
-                      maxWidth: isAssistant ? '85%' : '75%'
+                      justifyContent: isAssistant ? 'flex-start' : 'flex-end',
                     }}
                   >
                     {isAssistant && (
-                      <div style={{ width: '38px', height: '38px', borderRadius: '10px', background: 'linear-gradient(135deg, #0284c7, #2563eb)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, boxShadow: '0 4px 12px rgba(2, 132, 199, 0.3)' }}>
-                        <Bot size={20} style={{ color: '#fff' }} />
+                      <div className="msg-avatar" style={{ width: '36px', height: '36px', borderRadius: '10px', backgroundColor: '#4ba452', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, boxShadow: '0 2px 6px rgba(75, 164, 82, 0.3)' }}>
+                        <Bot size={18} style={{ color: '#ffffff' }} />
                       </div>
                     )}
 
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', alignItems: isAssistant ? 'flex-start' : 'flex-end' }}>
+                    <div 
+                      className={isAssistant ? "msg-content-assistant" : "msg-content-user"}
+                      style={{ 
+                        display: 'flex', 
+                        flexDirection: 'column', 
+                        gap: '5px', 
+                        alignItems: isAssistant ? 'flex-start' : 'flex-end',
+                        maxWidth: isAssistant ? '88%' : '78%'
+                      }}
+                    >
                       <div 
-                        className={isAssistant ? "glass" : ""}
+                        className="msg-bubble"
                         style={{
-                          padding: '16px 20px',
-                          borderRadius: isAssistant ? '4px 18px 18px 18px' : '18px 4px 18px 18px',
-                          background: isAssistant ? (msg.error ? 'rgba(153, 27, 27, 0.35)' : 'rgba(15, 23, 42, 0.85)') : 'linear-gradient(135deg, #0284c7, #2563eb)',
-                          color: '#fff',
-                          border: isAssistant ? (msg.error ? '1px solid rgba(239, 68, 68, 0.4)' : '1px solid rgba(255, 255, 255, 0.1)') : 'none',
-                          fontSize: '0.95rem',
-                          lineHeight: 1.6,
-                          whiteSpace: 'pre-wrap',
-                          wordBreak: 'break-word',
-                          boxShadow: '0 4px 16px rgba(0,0,0,0.2)'
+                          borderRadius: isAssistant ? '4px 16px 16px 16px' : '16px 4px 16px 16px',
+                          backgroundColor: isAssistant ? (msg.error ? '#fff5f5' : '#ffffff') : '#4ba452',
+                          color: isAssistant ? (msg.error ? '#c53030' : '#2d3748') : '#ffffff',
+                          border: isAssistant ? (msg.error ? '1px solid #feb2b2' : '1px solid #e2e8f0') : 'none',
                         }}
                       >
                         {msg.content}
+
+                        {/* Bouton pour écouter la réponse */}
+                        {isAssistant && !msg.error && (
+                          <div style={{ marginTop: '8px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <button
+                              onClick={() => playTTS(msg.content, index)}
+                              style={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '5px',
+                                padding: '4px 10px',
+                                borderRadius: '14px',
+                                border: '1px solid #c2e2c4',
+                                backgroundColor: isPlaying ? '#4ba452' : '#eef7ee',
+                                color: isPlaying ? '#ffffff' : '#3d8a43',
+                                fontSize: '0.75rem',
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                                transition: 'all 0.2s ease'
+                              }}
+                            >
+                              {isPlaying ? (
+                                <>
+                                  <Square size={11} /> Arrêter
+                                </>
+                              ) : (
+                                <>
+                                  <Volume2 size={12} /> Écouter la voix
+                                </>
+                              )}
+                            </button>
+                          </div>
+                        )}
                       </div>
 
-                      {/* Display Sources for Assistant Responses */}
+                      {/* Sources consultées */}
                       {isAssistant && msg.sources && msg.sources.length > 0 && (
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '4px' }}>
-                          <span style={{ fontSize: '0.75rem', color: '#64748b', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                            <BookOpen size={12} /> Sources consultées :
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginTop: '2px' }}>
+                          <span style={{ fontSize: '0.72rem', color: '#718096', display: 'flex', alignItems: 'center', gap: '4px', fontWeight: 600 }}>
+                            <BookOpen size={11} style={{ color: '#4ba452' }} /> Pages vérifiées :
                           </span>
                           {msg.sources.map((src, sIdx) => (
                             <span 
                               key={sIdx}
                               style={{
-                                fontSize: '0.75rem',
-                                background: 'rgba(255, 255, 255, 0.05)',
-                                border: '1px solid rgba(255, 255, 255, 0.1)',
-                                padding: '2px 8px',
-                                borderRadius: '6px',
-                                color: '#94a3b8'
+                                fontSize: '0.7rem',
+                                backgroundColor: '#eef7ee',
+                                border: '1px solid #c2e2c4',
+                                padding: '1px 6px',
+                                borderRadius: '4px',
+                                color: '#3d8a43',
+                                fontWeight: 600
                               }}
                             >
-                              Page {src.page} ({src.source})
+                              p.{src.page}
                             </span>
                           ))}
                         </div>
@@ -333,25 +585,39 @@ export default function App() {
                     </div>
 
                     {!isAssistant && (
-                      <div style={{ width: '38px', height: '38px', borderRadius: '10px', background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                        <User size={20} style={{ color: '#e2e8f0' }} />
+                      <div className="msg-avatar" style={{ width: '36px', height: '36px', borderRadius: '10px', backgroundColor: '#e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                        <User size={18} style={{ color: '#4a5568' }} />
                       </div>
                     )}
                   </div>
                 );
               })}
 
-              {isLoading && (
-                <div style={{ display: 'flex', gap: '14px', alignItems: 'center', alignSelf: 'flex-start' }}>
-                  <div style={{ width: '38px', height: '38px', borderRadius: '10px', background: 'linear-gradient(135deg, #0284c7, #2563eb)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    <Bot size={20} style={{ color: '#fff' }} />
+              {isTranscribing && (
+                <div className="msg-row" style={{ alignItems: 'center' }}>
+                  <div className="msg-avatar" style={{ width: '36px', height: '36px', borderRadius: '10px', backgroundColor: '#0080fe', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Mic size={18} style={{ color: '#ffffff' }} />
                   </div>
-                  <div className="glass" style={{ padding: '12px 18px', borderRadius: '4px 18px 18px 18px', display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    <span style={{ fontSize: '0.85rem', color: '#94a3b8' }}>Recherche dans les documents BANCOBU & analyse Gemini...</span>
-                    <div style={{ display: 'flex', gap: '4px' }}>
-                      <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#38bdf8', animation: 'pulse 1.4s infinite ease-in-out' }}></span>
-                      <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#38bdf8', animation: 'pulse 1.4s infinite ease-in-out 0.2s' }}></span>
-                      <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#38bdf8', animation: 'pulse 1.4s infinite ease-in-out 0.4s' }}></span>
+                  <div style={{ padding: '10px 14px', borderRadius: '4px 16px 16px 16px', backgroundColor: '#ffffff', border: '1px solid #cbd5e0', display: 'flex', alignItems: 'center', gap: '8px', boxShadow: '0 2px 6px rgba(0,0,0,0.04)' }}>
+                    <span style={{ fontSize: '0.82rem', color: '#2d3748', fontWeight: 600 }}>Transcription vocale en cours...</span>
+                    <div style={{ display: 'flex', gap: '3px' }}>
+                      <span style={{ width: '5px', height: '5px', borderRadius: '50%', backgroundColor: '#0080fe', animation: 'pulse 1s infinite' }}></span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {isLoading && (
+                <div className="msg-row" style={{ alignItems: 'center' }}>
+                  <div className="msg-avatar" style={{ width: '36px', height: '36px', borderRadius: '10px', backgroundColor: '#4ba452', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Bot size={18} style={{ color: '#ffffff' }} />
+                  </div>
+                  <div style={{ padding: '10px 14px', borderRadius: '4px 16px 16px 16px', backgroundColor: '#ffffff', border: '1px solid #e2e8f0', display: 'flex', alignItems: 'center', gap: '8px', boxShadow: '0 2px 6px rgba(0,0,0,0.04)' }}>
+                    <span style={{ fontSize: '0.82rem', color: '#718096' }}>Recherche BANCOBU & synthèse vocale...</span>
+                    <div style={{ display: 'flex', gap: '3px' }}>
+                      <span style={{ width: '5px', height: '5px', borderRadius: '50%', backgroundColor: '#4ba452' }}></span>
+                      <span style={{ width: '5px', height: '5px', borderRadius: '50%', backgroundColor: '#0080fe' }}></span>
+                      <span style={{ width: '5px', height: '5px', borderRadius: '50%', backgroundColor: '#de6906' }}></span>
                     </div>
                   </div>
                 </div>
@@ -359,38 +625,20 @@ export default function App() {
               <div ref={messagesEndRef} />
             </div>
 
-            {/* Suggested Prompts pills */}
+            {/* Questions fréquentes suggérées */}
             {messages.length <= 2 && (
-              <div style={{ marginTop: '16px', marginBottom: '8px' }}>
-                <p style={{ fontSize: '0.8rem', color: '#64748b', marginBottom: '8px', fontWeight: 600 }}>Suggestions fréquentes :</p>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+              <div>
+                <p style={{ fontSize: '0.72rem', color: '#718096', marginTop: '6px', marginBottom: '4px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.4px' }}>
+                  Suggestions rapides :
+                </p>
+                <div className="suggested-chips-container">
                   {suggestedQuestions.map((q, idx) => (
                     <button
                       key={idx}
                       onClick={() => handleSend(q)}
-                      style={{
-                        background: 'rgba(255, 255, 255, 0.04)',
-                        border: '1px solid rgba(255, 255, 255, 0.08)',
-                        padding: '6px 14px',
-                        borderRadius: '20px',
-                        color: '#94a3b8',
-                        fontSize: '0.8rem',
-                        cursor: 'pointer',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '6px',
-                        transition: 'all 0.2s ease'
-                      }}
-                      onMouseEnter={(e) => {
-                        e.currentTarget.style.borderColor = 'rgba(56, 189, 248, 0.4)';
-                        e.currentTarget.style.color = '#38bdf8';
-                      }}
-                      onMouseLeave={(e) => {
-                        e.currentTarget.style.borderColor = 'rgba(255, 255, 255, 0.08)';
-                        e.currentTarget.style.color = '#94a3b8';
-                      }}
+                      className="suggested-chip"
                     >
-                      <ChevronRight size={12} />
+                      <ChevronRight size={12} style={{ color: '#4ba452' }} />
                       {q}
                     </button>
                   ))}
@@ -398,65 +646,90 @@ export default function App() {
               </div>
             )}
 
-            {/* Input Box */}
-            <div style={{ marginTop: '16px' }}>
+            {/* Barre de saisie avec bouton Micro Vocal */}
+            <div style={{ marginTop: '8px' }}>
               <form 
                 onSubmit={(e) => { e.preventDefault(); handleSend(); }}
-                className="glass"
+                className="input-form"
                 style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  padding: '8px 12px',
-                  borderRadius: '16px',
-                  border: '1px solid rgba(255, 255, 255, 0.12)',
-                  boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)'
+                  border: isRecording ? '2px solid #ef4444' : '2px solid #cbd5e0',
+                  boxShadow: isRecording ? '0 0 14px rgba(239, 68, 68, 0.3)' : '0 3px 10px rgba(0, 0, 0, 0.05)',
                 }}
               >
-                <input
-                  type="text"
-                  placeholder="Posez votre question sur les produits ou services BANCOBU..."
-                  value={inputQuestion}
-                  onChange={(e) => setInputQuestion(e.target.value)}
-                  style={{
-                    flex: 1,
-                    background: 'transparent',
-                    border: 'none',
-                    outline: 'none',
-                    color: '#fff',
-                    padding: '10px 14px',
-                    fontSize: '0.95rem'
-                  }}
-                  disabled={isLoading}
-                />
+                {/* Bouton Micro */}
                 <button
-                  type="submit"
-                  disabled={!inputQuestion.trim() || isLoading}
-                  className="glow-btn"
+                  type="button"
+                  onClick={toggleRecording}
+                  className="mic-button"
+                  title={isRecording ? "Arrêter l'enregistrement (cliquez pour terminer)" : "Parler au micro"}
                   style={{
-                    padding: '10px 18px',
-                    borderRadius: '10px',
+                    backgroundColor: isRecording ? '#ef4444' : '#eef7ee',
+                    color: isRecording ? '#ffffff' : '#4ba452',
                     border: 'none',
-                    color: '#fff',
-                    cursor: !inputQuestion.trim() || isLoading ? 'not-allowed' : 'pointer',
-                    opacity: !inputQuestion.trim() || isLoading ? 0.5 : 1,
+                    borderRadius: '50%',
+                    width: '40px',
+                    height: '40px',
                     display: 'flex',
                     alignItems: 'center',
-                    gap: '8px',
-                    fontWeight: 600
+                    justifyContent: 'center',
+                    cursor: 'pointer',
+                    marginRight: '8px',
+                    flexShrink: 0,
+                    animation: isRecording ? 'pulse 1.5s infinite' : 'none'
                   }}
                 >
-                  <span>Envoyer</span>
-                  <Send size={16} />
+                  {isRecording ? <MicOff size={18} /> : <Mic size={18} />}
+                </button>
+
+                <input
+                  type="text"
+                  placeholder={
+                    isRecording 
+                      ? "🔴 Enregistrement en cours... Cliquez à nouveau pour envoyer" 
+                      : (isTranscribing ? "Transcription vocale..." : "Écrivez ou touchez le micro pour parler...")
+                  }
+                  value={inputQuestion}
+                  onChange={(e) => setInputQuestion(e.target.value)}
+                  className="input-text-field"
+                  disabled={isLoading || isTranscribing}
+                />
+
+                <button
+                  type="submit"
+                  disabled={!inputQuestion.trim() || isLoading || isTranscribing}
+                  className="send-button"
+                  style={{
+                    cursor: !inputQuestion.trim() || isLoading || isTranscribing ? 'not-allowed' : 'pointer',
+                    opacity: !inputQuestion.trim() || isLoading || isTranscribing ? 0.6 : 1,
+                  }}
+                >
+                  <span className="send-button-text">Envoyer</span>
+                  <Send size={14} />
                 </button>
               </form>
-              <p style={{ textAlign: 'center', fontSize: '0.72rem', color: '#64748b', marginTop: '8px' }}>
-                BANCOBU AI est connecté en temps réel aux données documentaires de la banque.
-              </p>
+
+              <div className="chat-disclaimer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '6px', fontSize: '0.72rem', color: '#a0aec0' }}>
+                <span>BANCOBU AI • Support vocal & écrit</span>
+                <span>© BANCOBU — Banque Commerciale du Burundi</span>
+              </div>
             </div>
 
           </div>
         )}
       </main>
+
+      {/* 4. FOOTER OFFICIEL BANCOBU (#2b2f3b) */}
+      <footer className={`footer-section ${activeTab === 'demo' ? 'footer-in-chat' : ''}`}>
+        <div style={{ maxWidth: '1200px', margin: '0 auto', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+          <div>
+            <span style={{ fontWeight: 700, color: '#ffffff' }}>BANCOBU S.A.</span> — Siège Social : Boulevard de la Liberté, Bujumbura
+          </div>
+          <div>
+            <span>Tél: +257 22 26 52 00 | info@bancobu.com</span>
+          </div>
+        </div>
+      </footer>
+
     </div>
   );
 }
