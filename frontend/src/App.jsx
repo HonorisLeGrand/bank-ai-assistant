@@ -3,11 +3,11 @@ import {
   Sparkles, Send, Bot, User, ShieldCheck, 
   BookOpen, ChevronRight, CheckCircle, 
   Database, Cpu, MessageSquare, Phone, MapPin,
-  Mic, MicOff, Volume2, Square
+  Mic, MicOff, Volume2, Square, PhoneCall, PhoneOff
 } from './Icons';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('demo'); // 'presentation' or 'demo'
+  const [activeTab, setActiveTab] = useState('demo'); // 'presentation', 'demo', or 'call'
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
@@ -21,6 +21,22 @@ export default function App() {
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [autoPlayAudio, setAutoPlayAudio] = useState(true);
   const [playingIndex, setPlayingIndex] = useState(null);
+
+  // --- États Mode Appel en Direct ---
+  const [callStatus, setCallStatus] = useState('idle'); // 'idle' | 'connected'
+  const [callAgentState, setCallAgentState] = useState('idle'); // 'speaking' | 'listening' | 'thinking'
+  const [callVoice, setCallVoice] = useState('fr-FR-DeniseNeural'); // 'fr-FR-DeniseNeural' ou 'fr-FR-HenriNeural'
+  const [callDuration, setCallDuration] = useState(0);
+  const [callUserSpoken, setCallUserSpoken] = useState('');
+  const [callAgentSpoken, setCallAgentSpoken] = useState('');
+  const [callHistory, setCallHistory] = useState([]);
+  const [callIsMuted, setCallIsMuted] = useState(false);
+
+  const callTimerRef = useRef(null);
+  const callAudioRef = useRef(null);
+  const callStatusRef = useRef('idle');
+  const callRecognitionRef = useRef(null);
+  const callIsMutedRef = useRef(false);
 
   const messagesEndRef = useRef(null);
   const recognitionRef = useRef(null);
@@ -295,6 +311,191 @@ export default function App() {
     }
   };
 
+  // --- Gestionnaires Mode Appel en Direct ---
+  const formatCallTime = (secs) => {
+    const mins = Math.floor(secs / 60);
+    const remSecs = secs % 60;
+    return `${mins < 10 ? '0' : ''}${mins}:${remSecs < 10 ? '0' : ''}${remSecs}`;
+  };
+
+  const startCall = async () => {
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.pause();
+      setPlayingIndex(null);
+    }
+    setCallStatus('connected');
+    callStatusRef.current = 'connected';
+    setCallDuration(0);
+    setCallUserSpoken('');
+    setCallHistory([]);
+    setCallIsMuted(false);
+    callIsMutedRef.current = false;
+
+    if (callTimerRef.current) clearInterval(callTimerRef.current);
+    callTimerRef.current = setInterval(() => {
+      setCallDuration((prev) => prev + 1);
+    }, 1000);
+
+    const welcomeMsg = "Bonjour et bienvenue au service client de la BANCOBU ! Je suis votre conseiller bancaire virtuel. Comment puis-je vous renseigner aujourd'hui ?";
+    await speakAgentCall(welcomeMsg);
+  };
+
+  const speakAgentCall = async (text) => {
+    if (callStatusRef.current !== 'connected') return;
+    setCallAgentState('speaking');
+    setCallAgentSpoken(text);
+    setCallHistory((prev) => [...prev, { role: 'agent', text }]);
+
+    try {
+      const response = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voice: callVoice })
+      });
+      if (!response.ok) throw new Error("Erreur TTS");
+      const blob = await response.blob();
+      const audioUrl = URL.createObjectURL(blob);
+      const audio = new Audio(audioUrl);
+      callAudioRef.current = audio;
+
+      audio.onended = () => {
+        if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
+          startCallListening();
+        } else if (callStatusRef.current === 'connected') {
+          setCallAgentState('idle');
+        }
+      };
+      await audio.play();
+    } catch (e) {
+      console.warn("Erreur lecture voix conseiller:", e);
+      setTimeout(() => {
+        if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
+          startCallListening();
+        }
+      }, 2500);
+    }
+  };
+
+  const startCallListening = () => {
+    if (callStatusRef.current !== 'connected' || callIsMutedRef.current) return;
+    setCallAgentState('listening');
+    setCallUserSpoken('');
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      try {
+        if (callRecognitionRef.current) {
+          try { callRecognitionRef.current.abort(); } catch (e) {}
+        }
+        const recognition = new SpeechRecognition();
+        recognition.continuous = false;
+        recognition.interimResults = true;
+        recognition.lang = 'fr-FR';
+
+        recognition.onresult = (event) => {
+          let interimTranscript = '';
+          let finalTranscript = '';
+          for (let i = event.resultIndex; i < event.results.length; ++i) {
+            if (event.results[i].isFinal) {
+              finalTranscript += event.results[i][0].transcript;
+            } else {
+              interimTranscript += event.results[i][0].transcript;
+            }
+          }
+          const spoken = (finalTranscript || interimTranscript).trim();
+          if (spoken) setCallUserSpoken(spoken);
+
+          if (finalTranscript.trim()) {
+            recognition.stop();
+            handleCallExchange(finalTranscript.trim());
+          }
+        };
+
+        recognition.onerror = (e) => {
+          console.warn("Call speech error:", e.error);
+          if (e.error === 'no-speech' && callStatusRef.current === 'connected' && !callIsMutedRef.current) {
+            setTimeout(() => {
+              if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
+                startCallListening();
+              }
+            }, 800);
+          }
+        };
+
+        recognition.onend = () => {
+          if (callStatusRef.current === 'connected' && !callIsMutedRef.current && callAgentState === 'listening') {
+            setTimeout(() => {
+              if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
+                try { recognition.start(); } catch (e) {}
+              }
+            }, 500);
+          }
+        };
+
+        callRecognitionRef.current = recognition;
+        recognition.start();
+      } catch (err) {
+        console.error("SpeechRecognition error:", err);
+      }
+    }
+  };
+
+  const handleCallExchange = async (question) => {
+    if (!question || callStatusRef.current !== 'connected') return;
+    setCallAgentState('thinking');
+    setCallHistory((prev) => [...prev, { role: 'user', text: question }]);
+
+    try {
+      const res = await fetch('/api/call/answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, voice: callVoice })
+      });
+      if (!res.ok) throw new Error("Erreur de réponse");
+      const data = await res.json();
+      await speakAgentCall(data.answer);
+    } catch (e) {
+      console.error("Erreur serveur appel:", e);
+      await speakAgentCall("Veuillez m'excuser, une petite interruption est survenue. Pourriez-vous répéter votre question s'il vous plaît ?");
+    }
+  };
+
+  const endCall = () => {
+    callStatusRef.current = 'idle';
+    setCallStatus('idle');
+    setCallAgentState('idle');
+    setCallUserSpoken('');
+    setCallAgentSpoken('');
+
+    if (callTimerRef.current) {
+      clearInterval(callTimerRef.current);
+      callTimerRef.current = null;
+    }
+    if (callAudioRef.current) {
+      callAudioRef.current.pause();
+      callAudioRef.current = null;
+    }
+    if (callRecognitionRef.current) {
+      try { callRecognitionRef.current.abort(); } catch (e) {}
+    }
+  };
+
+  const toggleCallMute = () => {
+    const nextMute = !callIsMuted;
+    setCallIsMuted(nextMute);
+    callIsMutedRef.current = nextMute;
+    if (nextMute) {
+      if (callRecognitionRef.current) {
+        try { callRecognitionRef.current.abort(); } catch (e) {}
+      }
+      setCallAgentState('idle');
+    } else {
+      if (callStatusRef.current === 'connected') {
+        startCallListening();
+      }
+    }
+  };
+
   return (
     <div className="app-container">
       
@@ -371,6 +572,24 @@ export default function App() {
               <Sparkles size={14} /> Conseiller Vocal
             </button>
             <button
+              onClick={() => setActiveTab('call')}
+              className="nav-btn"
+              style={{
+                border: activeTab === 'call' ? '2px solid #16a34a' : '1px solid #e2e8f0',
+                color: activeTab === 'call' ? '#ffffff' : '#4a5568',
+                backgroundColor: activeTab === 'call' ? '#16a34a' : '#ffffff',
+                boxShadow: activeTab === 'call' ? '0 4px 12px rgba(22, 163, 74, 0.25)' : 'none',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px'
+              }}
+            >
+              <PhoneCall size={14} /> Appel en Direct
+              {callStatus === 'connected' && (
+                <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#ef4444', display: 'inline-block', animation: 'pulse 1s infinite' }} />
+              )}
+            </button>
+            <button
               onClick={() => setActiveTab('presentation')}
               className="nav-btn"
               style={{
@@ -387,7 +606,7 @@ export default function App() {
       </header>
 
       {/* 3. CORPS DE PAGE */}
-      <main style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      <main style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, overflowY: activeTab === 'presentation' ? 'auto' : 'hidden' }}>
         {activeTab === 'presentation' ? (
           /* ================= PRESENTATION & INNOVATION ================= */
           <div style={{ maxWidth: '1140px', margin: '0 auto', padding: '30px 16px', width: '100%' }}>
@@ -476,6 +695,310 @@ export default function App() {
                   </p>
                 </div>
               </div>
+            </div>
+
+          </div>
+        ) : activeTab === 'call' ? (
+          /* ================= MODE APPEL EN DIRECT BANCOBU ================= */
+          <div style={{ maxWidth: '820px', margin: '0 auto', padding: '24px 16px', width: '100%', display: 'flex', flexDirection: 'column', gap: '20px' }}>
+            
+            {/* Carte Principale Appel */}
+            <div style={{ backgroundColor: '#ffffff', borderRadius: '20px', border: '1px solid #e2e8f0', boxShadow: '0 8px 30px rgba(0,0,0,0.06)', padding: '28px 20px', textAlign: 'center' }}>
+              
+              {/* En-tête statut de la ligne & sélection du conseiller */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', borderBottom: '1px solid #f0f4f8', paddingBottom: '16px', marginBottom: '24px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ 
+                    width: '10px', 
+                    height: '10px', 
+                    borderRadius: '50%', 
+                    backgroundColor: callStatus === 'connected' ? '#16a34a' : '#94a3b8',
+                    display: 'inline-block',
+                    boxShadow: callStatus === 'connected' ? '0 0 8px #16a34a' : 'none'
+                  }} />
+                  <span style={{ fontWeight: 700, fontSize: '0.9rem', color: '#1e293b' }}>
+                    {callStatus === 'connected' ? `En communication • ${formatCallTime(callDuration)}` : "Standard Téléphonique BANCOBU"}
+                  </span>
+                </div>
+
+                {/* Sélecteur de Voix */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{ fontSize: '0.8rem', color: '#64748b', fontWeight: 600 }}>Conseiller :</span>
+                  <button
+                    disabled={callStatus === 'connected'}
+                    onClick={() => setCallVoice('fr-FR-DeniseNeural')}
+                    style={{
+                      padding: '4px 10px',
+                      borderRadius: '14px',
+                      fontSize: '0.78rem',
+                      fontWeight: 600,
+                      border: callVoice === 'fr-FR-DeniseNeural' ? '2px solid #4ba452' : '1px solid #cbd5e1',
+                      backgroundColor: callVoice === 'fr-FR-DeniseNeural' ? '#eef7ee' : '#ffffff',
+                      color: callVoice === 'fr-FR-DeniseNeural' ? '#3d8a43' : '#64748b',
+                      cursor: callStatus === 'connected' ? 'default' : 'pointer',
+                    }}
+                  >
+                    👩 Denise
+                  </button>
+                  <button
+                    disabled={callStatus === 'connected'}
+                    onClick={() => setCallVoice('fr-FR-HenriNeural')}
+                    style={{
+                      padding: '4px 10px',
+                      borderRadius: '14px',
+                      fontSize: '0.78rem',
+                      fontWeight: 600,
+                      border: callVoice === 'fr-FR-HenriNeural' ? '2px solid #0080fe' : '1px solid #cbd5e1',
+                      backgroundColor: callVoice === 'fr-FR-HenriNeural' ? '#eff6ff' : '#ffffff',
+                      color: callVoice === 'fr-FR-HenriNeural' ? '#0066cc' : '#64748b',
+                      cursor: callStatus === 'connected' ? 'default' : 'pointer',
+                    }}
+                  >
+                    👨 Henri
+                  </button>
+                </div>
+              </div>
+
+              {/* État 1 : Appel non démarré (Prêt) */}
+              {callStatus === 'idle' && (
+                <div style={{ padding: '24px 0 16px' }}>
+                  <div style={{
+                    width: '96px',
+                    height: '96px',
+                    borderRadius: '50%',
+                    backgroundColor: '#eef7ee',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    margin: '0 auto 20px',
+                    color: '#4ba452',
+                    border: '2px solid #c2e2c4',
+                    boxShadow: '0 4px 16px rgba(75, 164, 82, 0.15)'
+                  }}>
+                    <PhoneCall size={44} />
+                  </div>
+                  <h2 style={{ fontSize: '1.45rem', fontWeight: 800, color: '#1e293b', marginBottom: '8px' }}>
+                    Parler avec votre Conseiller BANCOBU
+                  </h2>
+                  <p style={{ color: '#64748b', fontSize: '0.92rem', maxWidth: '520px', margin: '0 auto 26px', lineHeight: 1.55 }}>
+                    Lancez un appel en direct pour poser toutes vos questions oralement. Le système écoute et répond en continu en mains-libres, sans avoir besoin d'appuyer sur aucun bouton.
+                  </p>
+                  <button
+                    onClick={startCall}
+                    style={{
+                      backgroundColor: '#16a34a',
+                      color: '#ffffff',
+                      border: 'none',
+                      padding: '14px 34px',
+                      borderRadius: '30px',
+                      fontSize: '1.05rem',
+                      fontWeight: 700,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '10px',
+                      cursor: 'pointer',
+                      boxShadow: '0 8px 24px rgba(22, 163, 74, 0.35)',
+                      transition: 'all 0.2s ease',
+                    }}
+                  >
+                    <PhoneCall size={20} />
+                    Démarrer l'Appel Vocal
+                  </button>
+                </div>
+              )}
+
+              {/* État 2 : Appel en cours (Connecté) */}
+              {callStatus === 'connected' && (
+                <div style={{ padding: '10px 0' }}>
+                  
+                  {/* Visuel dynamique au centre */}
+                  <div style={{ minHeight: '130px', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '20px' }}>
+                    {callAgentState === 'speaking' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', height: '50px' }}>
+                          <span className="call-wave-bar" />
+                          <span className="call-wave-bar" />
+                          <span className="call-wave-bar" />
+                          <span className="call-wave-bar" />
+                          <span className="call-wave-bar" />
+                          <span className="call-wave-bar" />
+                          <span className="call-wave-bar" />
+                        </div>
+                        <span style={{ fontSize: '0.9rem', fontWeight: 700, color: '#16a34a' }}>
+                          Le conseiller vous répond oralement...
+                        </span>
+                      </div>
+                    )}
+
+                    {callAgentState === 'listening' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px' }}>
+                        <div className="call-radar" style={{
+                          width: '74px',
+                          height: '74px',
+                          borderRadius: '50%',
+                          backgroundColor: '#eef7ee',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          color: '#16a34a',
+                          border: '2px solid #86efac'
+                        }}>
+                          <Mic size={34} />
+                        </div>
+                        <span style={{ fontSize: '0.9rem', fontWeight: 700, color: '#16a34a' }}>
+                          À vous la parole, le conseiller vous écoute...
+                        </span>
+                      </div>
+                    )}
+
+                    {callAgentState === 'thinking' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px' }}>
+                        <div style={{
+                          width: '64px',
+                          height: '64px',
+                          borderRadius: '50%',
+                          backgroundColor: '#fef3c7',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          color: '#d97706',
+                          animation: 'pulse 1s infinite'
+                        }}>
+                          <Sparkles size={30} />
+                        </div>
+                        <span style={{ fontSize: '0.9rem', fontWeight: 700, color: '#d97706' }}>
+                          Recherche dans la documentation bancaire BANCOBU...
+                        </span>
+                      </div>
+                    )}
+
+                    {callAgentState === 'idle' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px' }}>
+                        <div style={{
+                          width: '64px',
+                          height: '64px',
+                          borderRadius: '50%',
+                          backgroundColor: '#f1f5f9',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          color: '#64748b'
+                        }}>
+                          <PhoneCall size={28} />
+                        </div>
+                        <span style={{ fontSize: '0.9rem', fontWeight: 600, color: '#64748b' }}>
+                          Ligne active
+                        </span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Bulle d'affichage de ce qui est dit en temps réel */}
+                  <div style={{
+                    minHeight: '72px',
+                    backgroundColor: '#f8fafc',
+                    borderRadius: '14px',
+                    padding: '16px 20px',
+                    border: '1px solid #e2e8f0',
+                    marginBottom: '26px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    textAlign: 'center'
+                  }}>
+                    {callAgentState === 'listening' ? (
+                      <p style={{ fontStyle: callUserSpoken ? 'normal' : 'italic', color: callUserSpoken ? '#1e293b' : '#94a3b8', fontSize: '0.96rem' }}>
+                        {callUserSpoken ? `« ${callUserSpoken} »` : "Parlez dans votre microphone..."}
+                      </p>
+                    ) : (
+                      <p style={{ color: '#334155', fontSize: '0.94rem', lineHeight: 1.55 }}>
+                        {callAgentSpoken ? `« ${callAgentSpoken} »` : "Connecté au standard BANCOBU."}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Barre de contrôle d'appel (Raccrocher / Mute) */}
+                  <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '16px' }}>
+                    <button
+                      onClick={toggleCallMute}
+                      style={{
+                        backgroundColor: callIsMuted ? '#fee2e2' : '#f1f5f9',
+                        color: callIsMuted ? '#dc2626' : '#475569',
+                        border: '1px solid #cbd5e1',
+                        padding: '10px 20px',
+                        borderRadius: '24px',
+                        fontWeight: 600,
+                        fontSize: '0.88rem',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      {callIsMuted ? <MicOff size={16} /> : <Mic size={16} />}
+                      {callIsMuted ? "Micro Coupé" : "Couper Micro"}
+                    </button>
+
+                    <button
+                      onClick={endCall}
+                      style={{
+                        backgroundColor: '#dc2626',
+                        color: '#ffffff',
+                        border: 'none',
+                        padding: '12px 30px',
+                        borderRadius: '24px',
+                        fontWeight: 700,
+                        fontSize: '0.95rem',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                        cursor: 'pointer',
+                        boxShadow: '0 4px 14px rgba(220, 38, 38, 0.35)'
+                      }}
+                    >
+                      <PhoneOff size={18} />
+                      Raccrocher
+                    </button>
+                  </div>
+
+                </div>
+              )}
+
+            </div>
+
+            {/* Historique écrit de l'appel pour relecture */}
+            {callHistory.length > 0 && (
+              <div style={{ backgroundColor: '#ffffff', borderRadius: '16px', border: '1px solid #e2e8f0', padding: '18px 20px', boxShadow: '0 2px 10px rgba(0,0,0,0.03)' }}>
+                <h3 style={{ fontSize: '0.95rem', fontWeight: 700, color: '#334155', marginBottom: '12px' }}>
+                  Transcription du dialogue ({callHistory.length} échanges)
+                </h3>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', maxHeight: '220px', overflowY: 'auto', paddingRight: '4px' }}>
+                  {callHistory.map((item, idx) => (
+                    <div 
+                      key={idx}
+                      style={{
+                        alignSelf: item.role === 'user' ? 'flex-end' : 'flex-start',
+                        backgroundColor: item.role === 'user' ? '#eef7ee' : '#f8fafc',
+                        border: item.role === 'user' ? '1px solid #c2e2c4' : '1px solid #e2e8f0',
+                        color: '#1e293b',
+                        padding: '8px 12px',
+                        borderRadius: '10px',
+                        fontSize: '0.85rem',
+                        maxWidth: '85%'
+                      }}
+                    >
+                      <span style={{ fontWeight: 700, fontSize: '0.75rem', color: item.role === 'user' ? '#16a34a' : '#0066cc', display: 'block', marginBottom: '2px' }}>
+                        {item.role === 'user' ? 'Vous' : `Conseiller BANCOBU (${callVoice.includes('Denise') ? 'Denise' : 'Henri'})`}
+                      </span>
+                      {item.text}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div style={{ textAlign: 'center', fontSize: '0.74rem', color: '#94a3b8', marginTop: '6px' }}>
+              BANCOBU S.A. — Siège Social : Boulevard de la Liberté, Bujumbura • Tél: +257 22 26 52 00
             </div>
 
           </div>
@@ -708,9 +1231,9 @@ export default function App() {
                 </button>
               </form>
 
-              <div className="chat-disclaimer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '6px', fontSize: '0.72rem', color: '#a0aec0' }}>
-                <span>BANCOBU AI • Support vocal & écrit</span>
-                <span>© BANCOBU — Banque Commerciale du Burundi</span>
+              <div className="chat-disclaimer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '8px', fontSize: '0.72rem', color: '#718096', padding: '0 4px' }}>
+                <span>BANCOBU AI • Conseiller Virtuel Officiel</span>
+                <span>Siège Social : Boulevard de la Liberté, Bujumbura • Tél: +257 22 26 52 00</span>
               </div>
             </div>
 
@@ -718,17 +1241,19 @@ export default function App() {
         )}
       </main>
 
-      {/* 4. FOOTER OFFICIEL BANCOBU (#2b2f3b) */}
-      <footer className={`footer-section ${activeTab === 'demo' ? 'footer-in-chat' : ''}`}>
-        <div style={{ maxWidth: '1200px', margin: '0 auto', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
-          <div>
-            <span style={{ fontWeight: 700, color: '#ffffff' }}>BANCOBU S.A.</span> — Siège Social : Boulevard de la Liberté, Bujumbura
+      {/* 4. FOOTER OFFICIEL BANCOBU (#2b2f3b) - Présentation uniquement */}
+      {activeTab === 'presentation' && (
+        <footer className="footer-section">
+          <div style={{ maxWidth: '1200px', margin: '0 auto', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+            <div>
+              <span style={{ fontWeight: 700, color: '#ffffff' }}>BANCOBU S.A.</span> — Siège Social : Boulevard de la Liberté, Bujumbura
+            </div>
+            <div>
+              <span>Tél: +257 22 26 52 00 | info@bancobu.com</span>
+            </div>
           </div>
-          <div>
-            <span>Tél: +257 22 26 52 00 | info@bancobu.com</span>
-          </div>
-        </div>
-      </footer>
+        </footer>
+      )}
 
     </div>
   );

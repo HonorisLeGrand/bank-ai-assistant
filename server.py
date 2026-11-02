@@ -98,6 +98,11 @@ class AnswerResponse(BaseModel):
 
 class TTSRequest(BaseModel):
     text: str
+    voice: Optional[str] = "fr-FR-DeniseNeural"
+
+class CallRequest(BaseModel):
+    question: str
+    voice: Optional[str] = "fr-FR-DeniseNeural"
 
 @app.get("/api/health")
 def health():
@@ -220,7 +225,8 @@ async def generate_speech(payload: TTSRequest):
         temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         temp_audio.close()
 
-        communicate = edge_tts.Communicate(clean_text, VOICE_NAME)
+        selected_voice = payload.voice if payload.voice else VOICE_NAME
+        communicate = edge_tts.Communicate(clean_text, selected_voice)
         await communicate.save(temp_audio.name)
 
         return FileResponse(
@@ -230,6 +236,81 @@ async def generate_speech(payload: TTSRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur TTS: {str(e)}")
+
+@app.post("/api/call/answer")
+def call_answer(payload: CallRequest):
+    """Réponse orale optimisée pour un appel téléphonique en direct avec le conseiller BANCOBU."""
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="La question ne peut pas être vide.")
+
+    # Salutations orales immédiates (< 10ms)
+    clean_q = re.sub(r'[^\w\s]', '', question.lower()).strip()
+    if clean_q in GREETINGS:
+        return {
+            "answer": "Bonjour et bienvenue au service client de la BANCOBU ! Je suis votre conseiller bancaire virtuel. Comment puis-je vous renseigner aujourd'hui ?",
+            "question": question
+        }
+
+    try:
+        gemini = get_gemini()
+        # 1. Embedding
+        embed_resp = gemini.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=question,
+            config={"output_dimensionality": 768}
+        )
+        query_vector = embed_resp.embeddings[0].values
+
+        # 2. Recherche vectorielle dans Qdrant
+        client_qdrant = get_qdrant()
+        results = client_qdrant.query_points(
+            collection_name=COLLECTION_NAME,
+            query=query_vector,
+            limit=TOP_K,
+            with_payload=True
+        )
+
+        passages = results.points
+        context = ""
+        for index, point in enumerate(passages, start=1):
+            data = point.payload or {}
+            chunk_text = str(data.get("text", ""))
+            context += f"EXTRAIT {index} :\n{chunk_text}\n\n"
+
+        if not passages:
+            return {
+                "answer": "Je ne trouve malheureusement pas cette information dans nos documents bancaires actuels. Je vous invite à vous rapprocher de votre agence BANCOBU.",
+                "question": question
+            }
+
+        prompt = f"""Tu es un conseiller clientèle téléphonique professionnel et bienveillant de la banque BANCOBU au Burundi.
+Un client est en ligne au téléphone avec toi et te pose une question.
+
+CONSIGNES POUR L'APPEL TÉLÉPHONIQUE :
+1. Adopte un ton oral naturel, fluide, chaleureux et rassurant.
+2. Fais des phrases claires et agréables à écouter. Évite impérativement le formatage écrit : PAS de listes à puces avec astérisques (*), PAS de titres (#), PAS de tableaux.
+3. Reste concis (environ 2 à 4 phrases) : un client au téléphone souhaite une réponse directe et précise sans monologue interminable.
+4. Base-toi fidèlement sur les extraits documentaires fournis ci-dessous. N'invente rien.
+5. Si l'information est introuvable ou incomplète, indique-le aimablement au client.
+
+QUESTION DU CLIENT AU TÉLÉPHONE :
+{question}
+
+EXTRAITS DOCUMENTAIRES BANCOBU DISPONIBLES :
+{context}
+
+Donne maintenant ta réponse orale directe au client :"""
+
+        answer_text = generate_with_fallback(gemini, prompt)
+        clean_answer = re.sub(r'[*#_`]', '', answer_text).strip()
+
+        return {
+            "answer": clean_answer,
+            "question": question
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
