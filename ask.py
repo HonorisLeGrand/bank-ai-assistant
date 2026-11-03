@@ -1,54 +1,45 @@
-
 import os
 import sys
 
-import ollama
 from dotenv import load_dotenv
-from google import genai
+import ollama
 from qdrant_client import QdrantClient
 
-
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION 100% LOCALE
 # ==========================================
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "embeddinggemma")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "embeddinggemma")
 
-COLLECTION_NAME = "bancobu_documents"
-QDRANT_PATH = "./qdrant_data"
-TOP_K = 5
-
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY absent du fichier .env")
-
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "bancobu_documents_ollama")
+QDRANT_PATH = os.getenv("QDRANT_PATH", "./qdrant_data")
+TOP_K = int(os.getenv("TOP_K", "3"))
 
 # ==========================================
 # INITIALISATION DES CLIENTS
 # ==========================================
 
-gemini = genai.Client(api_key=GEMINI_API_KEY)
-qdrant = QdrantClient(path=QDRANT_PATH)
-
+client_ollama = ollama.Client(host=OLLAMA_HOST)
+client_qdrant = QdrantClient(path=QDRANT_PATH)
 
 # ==========================================
-# RECHERCHE DOCUMENTAIRE
+# RECHERCHE DOCUMENTAIRE (EMBEDDINGGEMMA + QDRANT)
 # ==========================================
 
-def retrieve(question):
-    """Recherche les passages pertinents dans Qdrant."""
-
-    response = ollama.embed(
-        model=OLLAMA_MODEL,
+def retrieve(question: str):
+    """Recherche les passages pertinents dans Qdrant avec EmbeddingGemma."""
+    response = client_ollama.embed(
+        model=EMBEDDING_MODEL,
         input=question
     )
 
     query_vector = response["embeddings"][0]
 
-    results = qdrant.query_points(
+    results = client_qdrant.query_points(
         collection_name=COLLECTION_NAME,
         query=query_vector,
         limit=TOP_K,
@@ -57,27 +48,18 @@ def retrieve(question):
 
     return results.points
 
-
 # ==========================================
-# GENERATION DE LA REPONSE
+# GÉNÉRATION DE LA RÉPONSE (QWEN 2.5 3B)
 # ==========================================
 
-def generate_answer(question, passages):
-    """Génère une réponse naturelle et précise avec Gemini."""
-
+def generate_answer(question: str, passages):
+    """Génère une réponse claire et sourcée avec Qwen 2.5 3B."""
     if not passages:
-        return (
-            "Je n'ai trouvé aucune information pertinente "
-            "dans les documents disponibles pour répondre "
-            "à votre question."
-        )
+        return "Je n'ai trouvé aucune information pertinente dans les documents disponibles pour répondre à votre question."
 
     context = ""
-
     for index, point in enumerate(passages, start=1):
-
-        data = point.payload
-
+        data = point.payload or {}
         context += f"""
 EXTRAIT {index}
 Document : {data.get('source', 'Inconnu')}
@@ -85,128 +67,68 @@ Page : {data.get('page', 'Inconnue')}
 
 Contenu :
 {data.get('text', '')}
-
 """
 
-    prompt = f"""
-Tu es un assistant bancaire intelligent spécialisé
-dans les informations documentaires de BANCOBU.
+    prompt = f"""Tu es un conseiller bancaire intelligent spécialisé dans les produits et services de la banque BANCOBU au Burundi.
+Tu aides les clients à comprendre les offres, conditions et procédures.
 
-Tu aides les utilisateurs à comprendre les services,
-les produits, les conditions et les procédures bancaires.
+RÈGLES STRICTES :
+1. Réponds de manière concise, polie et directe (2 à 3 paragraphes courts ou puces).
+2. Utilise fidèlement et EXCLUSIVEMENT les extraits documentaires fournis ci-dessous. N'invente aucune information.
+3. Si une information n'est pas précisée dans les extraits, dis-le poliment.
+4. À la fin de ta réponse, cite précisément les numéros de page consultés (ex: Source : Page 2).
 
-TON COMPORTEMENT :
-
-Tu dois répondre comme un conseiller bancaire compétent :
-naturellement, intelligemment, clairement et directement.
-
-L'utilisateur ne doit pas avoir l'impression de lire
-une extraction de document ou un rapport technique.
-
-RÈGLES FONDAMENTALES :
-
-1. RÉPONSE DIRECTE
-Commence directement par répondre à la question.
-Évite les introductions inutiles.
-
-2. FIDÉLITÉ AUX SOURCES
-Utilise exclusivement les informations présentes
-dans les extraits fournis.
-N'invente aucune information.
-
-3. COMPRÉHENSION DU CONTEXTE
-Identifie précisément le produit ou le service concerné.
-Ne confonds jamais les conditions d'un compte courant
-avec celles d'un compte devise, Diaspora ou épargne.
-
-4. CLARTÉ
-Présente les informations de manière organisée.
-Utilise des listes lorsque cela facilite la compréhension.
-Explique les termes techniques si nécessaire.
-
-5. INFORMATIONS MANQUANTES
-Si les documents ne contiennent pas la réponse,
-dis-le clairement.
-Si une partie seulement de la réponse est disponible,
-présente les informations confirmées et précise
-ce qui n'est pas documenté.
-
-6. SOURCES
-À la fin de la réponse, indique les documents et pages
-qui justifient réellement tes affirmations.
-Ne cite pas les passages non pertinents.
-
-7. CONCISION
-Évite les répétitions et les conclusions inutiles.
-Ne présente pas les extraits retrouvés.
-Ne parle jamais de chunks, d'embeddings, de vecteurs,
-de scores de similarité ou de Qdrant.
-
-QUESTION DE L'UTILISATEUR :
-{question}
-
-INFORMATIONS DOCUMENTAIRES DISPONIBLES :
+INFORMATIONS DOCUMENTAIRES BANCOBU :
 {context}
 
-Rédige maintenant ta réponse.
-"""
+QUESTION DU CLIENT :
+{question}
 
-    response = gemini.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt
+RÉPONSE DU CONSEILLER :"""
+
+    response = client_ollama.generate(
+        model=LLM_MODEL,
+        prompt=prompt,
+        options={
+            "temperature": 0.2,
+            "top_p": 0.9,
+        }
     )
 
-    if not response.text:
-        return "Je n'ai pas pu générer une réponse à cette question."
-
-    return response.text.strip()
-
+    return response.get("response", "").strip()
 
 # ==========================================
-# INTERFACE UTILISATEUR
+# INTERFACE CLI TERMINAL
 # ==========================================
 
-def ask(question):
-
+def ask(question: str):
     if not question.strip():
         print("Veuillez saisir une question.")
         return
 
-    print("\nRecherche en cours...\n")
-
+    print("\n[RAG Local] Recherche documentaire avec EmbeddingGemma...")
     passages = retrieve(question)
+    print(f"[RAG Local] {len(passages)} extraits pertinents trouvés dans Qdrant.")
 
+    print(f"[RAG Local] Synthèse de la réponse avec {LLM_MODEL}...")
     answer = generate_answer(question, passages)
 
+    print("\n" + "=" * 60)
+    print("CONSEILLER BANCAIRE BANCOBU (100% LOCAL)")
     print("=" * 60)
-    print("ASSISTANT BANCAIRE BANCOBU")
-    print("=" * 60)
-
     print(answer)
-
-    print("=" * 60)
-
-
-# ==========================================
-# EXECUTION
-# ==========================================
+    print("=" * 60 + "\n")
 
 if __name__ == "__main__":
-
     try:
-
         if len(sys.argv) > 1:
-            question = " ".join(sys.argv[1:])
+            q = " ".join(sys.argv[1:])
         else:
-            question = input("Posez votre question : ")
-
-        ask(question)
-
+            q = input("Posez votre question à BANCOBU AI : ")
+        ask(q)
     except KeyboardInterrupt:
-        print("\nInterruption.")
-
-    except Exception as error:
-        print(f"\nUne erreur est survenue : {error}")
-
+        print("\nInterrompu.")
+    except Exception as e:
+        print(f"\nErreur : {e}")
     finally:
-        qdrant.close()
+        client_qdrant.close()

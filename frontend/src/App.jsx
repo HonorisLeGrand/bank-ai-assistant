@@ -6,6 +6,37 @@ import {
   Mic, MicOff, Volume2, Square, PhoneCall, PhoneOff
 } from './Icons';
 
+// ==============================================================================
+// CONSTANTES AUDIO & DÉTECTION DE SILENCE (VAD) POUR LE MODE APPEL
+// ==============================================================================
+const VAD_SILENCE_THRESHOLD = 0.006;     // Seuil RMS d'énergie pour distinguer parole et silence (sensible pour mobile)
+const VAD_SILENCE_DURATION_MS = 1000;    // Durée de silence requise pour finaliser la prise de parole (1.0s)
+const VAD_MIN_SPEECH_DURATION_MS = 300;  // Durée minimale de parole requise pour rejeter les bruits brefs (300ms)
+const VAD_MAX_RECORDING_MS = 15000;      // Durée maximale d'un enregistrement continu (15s)
+const VAD_POLL_INTERVAL_MS = 50;         // Période d'échantillonnage de l'AnalyserNode (50ms)
+
+/**
+ * Détecte les types MIME audio supportés par le navigateur pour MediaRecorder.
+ */
+function getSupportedMimeType() {
+  if (typeof MediaRecorder === 'undefined') {
+    return { mimeType: '', extension: 'wav' };
+  }
+  const candidates = [
+    { mime: 'audio/webm;codecs=opus', ext: 'webm' },
+    { mime: 'audio/webm', ext: 'webm' },
+    { mime: 'audio/ogg;codecs=opus', ext: 'ogg' },
+    { mime: 'audio/mp4', ext: 'mp4' },
+    { mime: 'audio/wav', ext: 'wav' },
+  ];
+  for (const c of candidates) {
+    if (MediaRecorder.isTypeSupported(c.mime)) {
+      return { mimeType: c.mime, extension: c.ext };
+    }
+  }
+  return { mimeType: '', extension: 'wav' };
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('demo'); // 'presentation', 'demo', or 'call'
   const [messages, setMessages] = useState([
@@ -23,26 +54,47 @@ export default function App() {
   const [playingIndex, setPlayingIndex] = useState(null);
 
   // --- États Mode Appel en Direct ---
-  const [callStatus, setCallStatus] = useState('idle'); // 'idle' | 'connected'
-  const [callAgentState, setCallAgentState] = useState('idle'); // 'speaking' | 'listening' | 'thinking'
-  const [callVoice, setCallVoice] = useState('fr-FR-DeniseNeural'); // 'fr-FR-DeniseNeural' ou 'fr-FR-HenriNeural'
+  // callStatus : 'idle' | 'connected'
+  const [callStatus, setCallStatus] = useState('idle');
+  // callAgentState : 'idle' | 'requesting_permission' | 'recording' | 'transcribing' | 'thinking' | 'speaking' | 'error'
+  const [callAgentState, setCallAgentState] = useState('idle');
+  const [callVoice, setCallVoice] = useState('siwis');
   const [callDuration, setCallDuration] = useState(0);
   const [callUserSpoken, setCallUserSpoken] = useState('');
   const [callAgentSpoken, setCallAgentSpoken] = useState('');
   const [callHistory, setCallHistory] = useState([]);
   const [callIsMuted, setCallIsMuted] = useState(false);
+  const [callAudioLevel, setCallAudioLevel] = useState(0);
 
-  const callTimerRef = useRef(null);
-  const callAudioRef = useRef(null);
-  const callStatusRef = useRef('idle');
-  const callRecognitionRef = useRef(null);
-  const callIsMutedRef = useRef(false);
-
+  // --- Références Mode Chat Classique ---
   const messagesEndRef = useRef(null);
-  const recognitionRef = useRef(null);
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
-  const audioPlayerRef = useRef(null);
+  const classicRecorderRef = useRef(null);
+  const classicStreamRef = useRef(null);
+  const classicChunksRef = useRef([]);
+  const chatAudioPlayerRef = useRef(null);
+  const chatAudioUrlRef = useRef(null);
+
+  // --- Références Mode Appel en Direct ---
+  const callTimerRef = useRef(null);
+  const callStatusRef = useRef('idle');
+  const callAgentStateRef = useRef('idle');
+  const callIsMutedRef = useRef(false);
+  const callAudioRef = useRef(null);
+  const callAudioPlayerRef = useRef(null);
+  const callAudioUrlRef = useRef(null);
+  const callPlaybackTimerRef = useRef(null);
+  const callStreamRef = useRef(null);
+  const callAudioCtxRef = useRef(null);
+  const callMediaRecorderRef = useRef(null);
+  const callChunksRef = useRef([]);
+  const callVadIntervalRef = useRef(null);
+  const finishCallRecordingRef = useRef(null);
+
+  const triggerCallFinish = () => {
+    if (finishCallRecordingRef.current) {
+      finishCallRecordingRef.current();
+    }
+  };
 
   const suggestedQuestions = [
     "Conditions compte courant ?",
@@ -50,6 +102,11 @@ export default function App() {
     "Avantages compte KIRA MAMA ?",
     "Carte Visa prépayée ?"
   ];
+
+  const updateCallAgentState = (newState) => {
+    callAgentStateRef.current = newState;
+    setCallAgentState(newState);
+  };
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -59,141 +116,102 @@ export default function App() {
     scrollToBottom();
   }, [messages, isLoading, isTranscribing]);
 
-  // Initialisation du module Speech-To-Text Web Speech API (fallback navigateur)
-  useEffect(() => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (SpeechRecognition) {
+  // ==============================================================================
+  // 1. GESTION DU MICROPHONE CLASSIQUE (MEDIARECORDER + WHISPER.CPP LOCAL)
+  // ==============================================================================
+
+  const stopClassicRecording = () => {
+    setIsRecording(false);
+    if (classicRecorderRef.current && classicRecorderRef.current.state !== 'inactive') {
       try {
-        const recognition = new SpeechRecognition();
-        recognition.continuous = false;
-        recognition.interimResults = false;
-        recognition.lang = 'fr-FR';
-
-        recognition.onresult = (event) => {
-          const transcript = event.results[0][0].transcript;
-          if (transcript) {
-            setInputQuestion(transcript);
-            handleSend(transcript);
-          }
-        };
-
-        recognition.onerror = (event) => {
-          console.warn("SpeechRecognition avertissement:", event.error);
-          setIsRecording(false);
-        };
-
-        recognition.onend = () => {
-          setIsRecording(false);
-        };
-
-        recognitionRef.current = recognition;
+        classicRecorderRef.current.stop();
       } catch (e) {
-        console.warn("SpeechRecognition init error:", e);
+        console.warn("Erreur arrêt classicRecorder:", e);
       }
     }
-  }, []);
-
-  // Déclencher ou arrêter l'enregistrement audio
-  const toggleRecording = async () => {
-    if (isRecording) {
-      stopRecording();
-      return;
-    }
-
-    // 1. Priorité à la reconnaissance native ultra-rapide (détection automatique de fin de parole)
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.start();
-        setIsRecording(true);
-        return;
-      } catch (e) {
-        console.warn("SpeechRecognition start échec, bascule MediaRecorder:", e);
-      }
-    }
-
-    // 2. Alternative MediaRecorder (capture et transcription serveur)
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      await startMediaRecording();
-      return;
-    }
-
-    alert("Veuillez autoriser l'accès au microphone dans votre navigateur.");
   };
 
-  const startMediaRecording = async () => {
-    audioChunksRef.current = [];
+  const startClassicRecording = async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      alert("Votre navigateur ne supporte pas la capture microphone ou le contexte n'est pas sécurisé (HTTPS).");
+      return;
+    }
+
+    // Arrêter l'audio en cours de lecture pour éviter tout larsen
+    if (chatAudioPlayerRef.current) {
+      chatAudioPlayerRef.current.pause();
+      setPlayingIndex(null);
+    }
+
+    classicChunksRef.current = [];
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      
-      let mimeType = '';
-      if (typeof MediaRecorder !== 'undefined') {
-        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-          mimeType = 'audio/webm;codecs=opus';
-        } else if (MediaRecorder.isTypeSupported('audio/webm')) {
-          mimeType = 'audio/webm';
-        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
-          mimeType = 'audio/mp4';
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
         }
-      }
+      });
+      classicStreamRef.current = stream;
 
+      const { mimeType, extension } = getSupportedMimeType();
       const options = mimeType ? { mimeType } : undefined;
       const recorder = new MediaRecorder(stream, options);
 
       recorder.ondataavailable = (event) => {
         if (event.data && event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
+          classicChunksRef.current.push(event.data);
         }
       };
 
       recorder.onstop = async () => {
-        stream.getTracks().forEach(track => track.stop());
-        if (audioChunksRef.current.length > 0) {
-          const actualMime = recorder.mimeType || 'audio/webm';
-          const audioBlob = new Blob(audioChunksRef.current, { type: actualMime });
-          await sendAudioForTranscription(audioBlob);
+        // Libération propre des pistes matérielles APRES la fin de l'enregistrement
+        if (classicStreamRef.current) {
+          classicStreamRef.current.getTracks().forEach(track => track.stop());
+          classicStreamRef.current = null;
+        }
+
+        if (classicChunksRef.current.length > 0) {
+          const actualMime = recorder.mimeType || mimeType || 'audio/webm';
+          const audioBlob = new Blob(classicChunksRef.current, { type: actualMime });
+          if (audioBlob.size > 200) {
+            await sendAudioForTranscription(audioBlob, extension);
+          } else {
+            alert("Enregistrement audio trop court ou vide. Veuillez parler plus près du micro.");
+          }
         }
       };
 
-      recorder.start();
-      mediaRecorderRef.current = recorder;
+      // Timeslice 200ms pour garantir la transmission continue des paquets audio
+      recorder.start(200);
+      classicRecorderRef.current = recorder;
       setIsRecording(true);
-      return;
     } catch (err) {
-      console.warn("Échec getUserMedia :", err);
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        alert("Vous avez refusé l'accès au microphone. Cliquez sur l'icône de cadenas/paramètres dans la barre d'adresse pour autoriser le micro.");
-      } else {
-        alert("Impossible de démarrer l'enregistrement : " + (err.message || "Erreur microphone"));
-      }
+      console.warn("Erreur getUserMedia classique :", err);
       setIsRecording(false);
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        alert("Accès au microphone refusé. Cliquez sur l'icône de cadenas dans la barre d'adresse pour autoriser le microphone.");
+      } else {
+        alert("Impossible d'activer le microphone : " + (err.message || "Erreur périphérique"));
+      }
     }
   };
 
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      try {
-        mediaRecorderRef.current.stop();
-      } catch (e) {
-        console.warn(e);
-      }
+  const toggleRecording = () => {
+    if (isRecording) {
+      stopClassicRecording();
+    } else {
+      startClassicRecording();
     }
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch (e) {
-        console.warn(e);
-      }
-    }
-    setIsRecording(false);
   };
 
-  // Envoi du blob audio au serveur FastAPI pour transcription Gemini
-  const sendAudioForTranscription = async (blob) => {
+  // Envoi du blob audio à /api/transcribe (Whisper.cpp Small local sur Jetson Orin Nano)
+  const sendAudioForTranscription = async (blob, extension = 'webm') => {
     setIsTranscribing(true);
     try {
       const formData = new FormData();
-      formData.append('file', blob, 'audio_prompt.webm');
+      formData.append('file', blob, `audio_input.${extension}`);
 
       const response = await fetch('/api/transcribe', {
         method: 'POST',
@@ -201,7 +219,8 @@ export default function App() {
       });
 
       if (!response.ok) {
-        throw new Error("Erreur serveur lors de la transcription");
+        const errorData = await response.json().catch(() => null);
+        throw new Error(errorData?.detail || `Erreur serveur ${response.status}`);
       }
 
       const data = await response.json();
@@ -211,21 +230,24 @@ export default function App() {
         setInputQuestion(transcribedText);
         handleSend(transcribedText);
       } else {
-        alert("Aucune parole audible détectée. Veuillez parler plus près du micro.");
+        alert("Aucune parole audible détectée par Whisper.cpp. Veuillez parler plus près du microphone.");
       }
     } catch (err) {
-      console.error("Erreur transcription vocale:", err);
-      alert("Erreur lors de la transcription vocale. Vous pouvez également poser votre question par écrit.");
+      console.error("Erreur transcription Whisper:", err);
+      alert(`Erreur de transcription vocale : ${err.message || "Impossible de contacter le serveur Jetson"}`);
     } finally {
       setIsTranscribing(false);
     }
   };
 
-  // Jouer la synthèse vocale d'un message
+  // Synthèse vocale Piper TTS pour un message du chat
   const playTTS = async (text, msgIndex) => {
     try {
       if (playingIndex === msgIndex) {
-        audioPlayerRef.current?.pause();
+        if (chatAudioPlayerRef.current) {
+          chatAudioPlayerRef.current.pause();
+          chatAudioPlayerRef.current.currentTime = 0;
+        }
         setPlayingIndex(null);
         return;
       }
@@ -234,20 +256,31 @@ export default function App() {
       const response = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text })
+        body: JSON.stringify({ text, voice: 'siwis' })
       });
 
-      if (!response.ok) throw new Error("Erreur génération audio");
+      if (!response.ok) {
+        const errJson = await response.json().catch(() => null);
+        throw new Error(errJson?.detail || "Erreur de génération audio Piper");
+      }
 
       const blob = await response.blob();
+      if (chatAudioUrlRef.current) {
+        URL.revokeObjectURL(chatAudioUrlRef.current);
+      }
       const audioUrl = URL.createObjectURL(blob);
+      chatAudioUrlRef.current = audioUrl;
 
-      if (audioPlayerRef.current) {
-        audioPlayerRef.current.src = audioUrl;
-        audioPlayerRef.current.play();
-        audioPlayerRef.current.onended = () => {
+      if (chatAudioPlayerRef.current) {
+        chatAudioPlayerRef.current.src = audioUrl;
+        chatAudioPlayerRef.current.onended = () => {
           setPlayingIndex(null);
+          if (chatAudioUrlRef.current) {
+            URL.revokeObjectURL(chatAudioUrlRef.current);
+            chatAudioUrlRef.current = null;
+          }
         };
+        await chatAudioPlayerRef.current.play();
       }
     } catch (err) {
       console.error("Erreur lecture audio :", err);
@@ -255,13 +288,15 @@ export default function App() {
     }
   };
 
+  // Envoi d'une question écrite ou transcrite vers /api/ask
   const handleSend = async (questionText) => {
+    if (isRecording) {
+      stopClassicRecording();
+      return;
+    }
+
     const query = questionText || inputQuestion;
     if (!query.trim() || isLoading) return;
-
-    if (isRecording) {
-      stopRecording();
-    }
 
     const userMessage = { role: 'user', content: query };
     setMessages((prev) => [...prev, userMessage]);
@@ -311,20 +346,123 @@ export default function App() {
     }
   };
 
-  // --- Gestionnaires Mode Appel en Direct ---
+  // ==============================================================================
+  // 2. GESTION DU MODE APPEL EN DIRECT (VAD + PIPER + ANTI-LARSEN + BARGE-IN)
+  // ==============================================================================
+
   const formatCallTime = (secs) => {
     const mins = Math.floor(secs / 60);
     const remSecs = secs % 60;
     return `${mins < 10 ? '0' : ''}${mins}:${remSecs < 10 ? '0' : ''}${remSecs}`;
   };
 
+  // Nettoyage complet des flux audio de capture
+  const stopCallCapture = () => {
+    finishCallRecordingRef.current = null;
+    if (callVadIntervalRef.current) {
+      clearInterval(callVadIntervalRef.current);
+      callVadIntervalRef.current = null;
+    }
+    setCallAudioLevel(0);
+    if (callMediaRecorderRef.current && callMediaRecorderRef.current.state !== 'inactive') {
+      try { callMediaRecorderRef.current.stop(); } catch (e) {}
+      callMediaRecorderRef.current = null;
+    }
+    if (callAudioCtxRef.current) {
+      try { callAudioCtxRef.current.close(); } catch (e) {}
+      callAudioCtxRef.current = null;
+    }
+    if (callStreamRef.current) {
+      try { callStreamRef.current.getTracks().forEach(t => t.stop()); } catch (e) {}
+      callStreamRef.current = null;
+    }
+  };
+
+  // Coupure temporaire du micro (Anti-larsen strict pendant que la conseillère parle)
+  const pauseCallMicrophone = () => {
+    finishCallRecordingRef.current = null;
+    if (callVadIntervalRef.current) {
+      clearInterval(callVadIntervalRef.current);
+      callVadIntervalRef.current = null;
+    }
+    setCallAudioLevel(0);
+    if (callMediaRecorderRef.current && callMediaRecorderRef.current.state !== 'inactive') {
+      try { callMediaRecorderRef.current.stop(); } catch (e) {}
+      callMediaRecorderRef.current = null;
+    }
+    if (callStreamRef.current) {
+      callStreamRef.current.getAudioTracks().forEach(t => { t.enabled = false; });
+    }
+  };
+
+  // Nettoyage de la lecture audio synthétique
+  const stopCallPlayback = () => {
+    if (callPlaybackTimerRef.current) {
+      clearTimeout(callPlaybackTimerRef.current);
+      callPlaybackTimerRef.current = null;
+    }
+    const audioEl = callAudioPlayerRef.current || callAudioRef.current;
+    if (audioEl) {
+      try {
+        audioEl.pause();
+        audioEl.currentTime = 0;
+      } catch (e) {}
+    }
+    callAudioRef.current = null;
+    if (callAudioUrlRef.current) {
+      try { URL.revokeObjectURL(callAudioUrlRef.current); } catch (e) {}
+      callAudioUrlRef.current = null;
+    }
+  };
+
+  // Démarrer l'appel vocal
   const startCall = async () => {
-    if (audioPlayerRef.current) {
-      audioPlayerRef.current.pause();
+    if (chatAudioPlayerRef.current) {
+      chatAudioPlayerRef.current.pause();
       setPlayingIndex(null);
     }
+    stopCallCapture();
+    stopCallPlayback();
+
+    // 1. Demande de permission microphone sur le clic/tap utilisateur (crucial sur mobile)
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        alert("Votre navigateur ne supporte pas la capture microphone ou le contexte n'est pas sécurisé (HTTPS).");
+        return;
+      }
+      const initialStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+      // Couper immédiatement les pistes pour respecter la règle anti-larsen pendant le message d'accueil
+      initialStream.getAudioTracks().forEach(t => { t.enabled = false; });
+      callStreamRef.current = initialStream;
+    } catch (permErr) {
+      console.warn("Permission microphone refusée lors de startCall :", permErr);
+      alert("Accès au microphone requis pour l'appel. Veuillez autoriser le microphone dans votre navigateur.");
+      return;
+    }
+
+    // 2. Initialiser et réveiller Web Audio Context dans ce geste utilisateur
+    try {
+      const AudioCtxClass = window.AudioContext || window.webkitAudioContext;
+      if (AudioCtxClass) {
+        const audioCtx = new AudioCtxClass();
+        if (audioCtx.state === 'suspended') {
+          await audioCtx.resume();
+        }
+        callAudioCtxRef.current = audioCtx;
+      }
+    } catch (ctxErr) {
+      console.warn("Erreur réveil AudioContext:", ctxErr);
+    }
+
     setCallStatus('connected');
     callStatusRef.current = 'connected';
+    updateCallAgentState('idle');
     setCallDuration(0);
     setCallUserSpoken('');
     setCallHistory([]);
@@ -336,13 +474,63 @@ export default function App() {
       setCallDuration((prev) => prev + 1);
     }, 1000);
 
-    const welcomeMsg = "Bonjour et bienvenue au service client de la BANCOBU ! Je suis votre conseiller bancaire virtuel. Comment puis-je vous renseigner aujourd'hui ?";
+    const welcomeMsg = "Bonjour et bienvenue au service client de la BANCOBU ! Je suis votre conseillère bancaire virtuelle. Comment puis-je vous renseigner aujourd'hui ?";
     await speakAgentCall(welcomeMsg);
   };
 
+  // Clôture de l'appel vocal
+  const endCall = () => {
+    callStatusRef.current = 'idle';
+    setCallStatus('idle');
+    updateCallAgentState('idle');
+    setCallUserSpoken('');
+    setCallAgentSpoken('');
+    setCallAudioLevel(0);
+
+    if (callTimerRef.current) {
+      clearInterval(callTimerRef.current);
+      callTimerRef.current = null;
+    }
+    stopCallCapture();
+    stopCallPlayback();
+  };
+
+  // Couper / Rétablir le microphone pendant l'appel
+  const toggleCallMute = () => {
+    const nextMute = !callIsMuted;
+    setCallIsMuted(nextMute);
+    callIsMutedRef.current = nextMute;
+    if (nextMute) {
+      pauseCallMicrophone();
+      if (callAgentStateRef.current === 'recording') {
+        updateCallAgentState('idle');
+      }
+    } else {
+      if (callStatusRef.current === 'connected' && callAgentStateRef.current !== 'speaking') {
+        startCallListening();
+      }
+    }
+  };
+
+  // Interruption explicite (barge-in via bouton)
+  const handleCallInterrupt = () => {
+    stopCallPlayback();
+    if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
+      startCallListening();
+    } else {
+      updateCallAgentState('idle');
+    }
+  };
+
+  // Synthèse vocale Piper et restitution audio
   const speakAgentCall = async (text) => {
     if (callStatusRef.current !== 'connected') return;
-    setCallAgentState('speaking');
+
+    // RÈGLE ANTI-LARSEN STRICTE : Le micro est 100% coupé avant d'émettre le moindre son
+    pauseCallMicrophone();
+    stopCallPlayback();
+
+    updateCallAgentState('speaking');
     setCallAgentSpoken(text);
     setCallHistory((prev) => [...prev, { role: 'agent', text }]);
 
@@ -352,155 +540,320 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, voice: callVoice })
       });
-      if (!response.ok) throw new Error("Erreur TTS");
-      const blob = await response.blob();
-      const audioUrl = URL.createObjectURL(blob);
-      const audio = new Audio(audioUrl);
-      callAudioRef.current = audio;
 
-      audio.onended = () => {
+      if (!response.ok) {
+        throw new Error(`Erreur TTS ${response.status}`);
+      }
+
+      const blob = await response.blob();
+      if (callStatusRef.current !== 'connected') return;
+
+      const audioUrl = URL.createObjectURL(blob);
+      callAudioUrlRef.current = audioUrl;
+
+      // Utiliser l'élément DOM <audio> (très robuste sur mobile) ou fallback sur Audio()
+      const audioEl = callAudioPlayerRef.current || new Audio();
+      callAudioRef.current = audioEl;
+      audioEl.src = audioUrl;
+
+      let playbackFinished = false;
+      const onPlaybackDone = () => {
+        if (playbackFinished) return;
+        playbackFinished = true;
+        if (callPlaybackTimerRef.current) {
+          clearTimeout(callPlaybackTimerRef.current);
+          callPlaybackTimerRef.current = null;
+        }
+        stopCallPlayback();
         if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
           startCallListening();
         } else if (callStatusRef.current === 'connected') {
-          setCallAgentState('idle');
+          updateCallAgentState('idle');
         }
       };
-      await audio.play();
+
+      audioEl.onended = onPlaybackDone;
+      audioEl.onerror = (e) => {
+        console.warn("Erreur lecture audio Piper:", e);
+        onPlaybackDone();
+      };
+
+      // Sécurité anti-blocage mobile : calculer la durée théorique exacte (WAV 16-bit 22050Hz mono = 44100 octets/seconde)
+      const estimatedSecs = Math.max(1.5, (blob.size - 44) / 44100);
+      const safetyTimeoutMs = Math.round((estimatedSecs + 0.6) * 1000);
+      callPlaybackTimerRef.current = setTimeout(() => {
+        console.log(`Sécurité durée audio atteinte (${safetyTimeoutMs}ms), transition automatique vers l'écoute.`);
+        onPlaybackDone();
+      }, safetyTimeoutMs);
+
+      await audioEl.play().catch(playErr => {
+        console.warn("Erreur play() audio (autoplay mobile):", playErr);
+        onPlaybackDone();
+      });
+
     } catch (e) {
-      console.warn("Erreur lecture voix conseiller:", e);
+      console.warn("Erreur synthèse ou lecture vocale conseiller:", e);
+      stopCallPlayback();
       setTimeout(() => {
         if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
           startCallListening();
         }
-      }, 2500);
+      }, 1000);
     }
   };
 
-  const startCallListening = () => {
+  // Écoute vocale mains-libres avec VAD (Voice Activity Detection)
+  const startCallListening = async () => {
     if (callStatusRef.current !== 'connected' || callIsMutedRef.current) return;
-    setCallAgentState('listening');
+    if (callAgentStateRef.current === 'recording') return;
+
+    pauseCallMicrophone();
+
+    updateCallAgentState('requesting_permission');
     setCallUserSpoken('');
-
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (SpeechRecognition) {
-      try {
-        if (callRecognitionRef.current) {
-          try { callRecognitionRef.current.abort(); } catch (e) {}
-        }
-        const recognition = new SpeechRecognition();
-        recognition.continuous = false;
-        recognition.interimResults = true;
-        recognition.lang = 'fr-FR';
-
-        recognition.onresult = (event) => {
-          let interimTranscript = '';
-          let finalTranscript = '';
-          for (let i = event.resultIndex; i < event.results.length; ++i) {
-            if (event.results[i].isFinal) {
-              finalTranscript += event.results[i][0].transcript;
-            } else {
-              interimTranscript += event.results[i][0].transcript;
-            }
-          }
-          const spoken = (finalTranscript || interimTranscript).trim();
-          if (spoken) setCallUserSpoken(spoken);
-
-          if (finalTranscript.trim()) {
-            recognition.stop();
-            handleCallExchange(finalTranscript.trim());
-          }
-        };
-
-        recognition.onerror = (e) => {
-          console.warn("Call speech error:", e.error);
-          if (e.error === 'no-speech' && callStatusRef.current === 'connected' && !callIsMutedRef.current) {
-            setTimeout(() => {
-              if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
-                startCallListening();
-              }
-            }, 800);
-          }
-        };
-
-        recognition.onend = () => {
-          if (callStatusRef.current === 'connected' && !callIsMutedRef.current && callAgentState === 'listening') {
-            setTimeout(() => {
-              if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
-                try { recognition.start(); } catch (e) {}
-              }
-            }, 500);
-          }
-        };
-
-        callRecognitionRef.current = recognition;
-        recognition.start();
-      } catch (err) {
-        console.error("SpeechRecognition error:", err);
-      }
-    }
-  };
-
-  const handleCallExchange = async (question) => {
-    if (!question || callStatusRef.current !== 'connected') return;
-    setCallAgentState('thinking');
-    setCallHistory((prev) => [...prev, { role: 'user', text: question }]);
 
     try {
-      const res = await fetch('/api/call/answer', {
+      let stream = callStreamRef.current;
+      // Si le flux est absent, inactif ou terminé, en réobtenir un (la permission a déjà été accordée au clic initial !)
+      if (!stream || !stream.active || stream.getAudioTracks().length === 0 || stream.getAudioTracks()[0].readyState === 'ended') {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+        callStreamRef.current = stream;
+      }
+
+      // Activer les pistes micro
+      stream.getAudioTracks().forEach(t => { t.enabled = true; });
+
+      if (callStatusRef.current !== 'connected' || callIsMutedRef.current) {
+        stream.getAudioTracks().forEach(t => { t.enabled = false; });
+        return;
+      }
+
+      updateCallAgentState('recording');
+
+      // Configuration / Réveil Web Audio API
+      let audioCtx = callAudioCtxRef.current;
+      const AudioCtxClass = window.AudioContext || window.webkitAudioContext;
+      if (!audioCtx || audioCtx.state === 'closed') {
+        audioCtx = new AudioCtxClass();
+        callAudioCtxRef.current = audioCtx;
+      }
+      if (audioCtx.state === 'suspended') {
+        try { await audioCtx.resume(); } catch (e) {}
+      }
+
+      let sourceNode = null;
+      let analyserNode = null;
+      try {
+        sourceNode = audioCtx.createMediaStreamSource(stream);
+        analyserNode = audioCtx.createAnalyser();
+        analyserNode.fftSize = 512;
+        analyserNode.smoothingTimeConstant = 0.2;
+        sourceNode.connect(analyserNode);
+      } catch (errNode) {
+        console.warn("Erreur source/analyser Node:", errNode);
+      }
+
+      // Configuration du MediaRecorder
+      const { mimeType, extension } = getSupportedMimeType();
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      callMediaRecorderRef.current = recorder;
+      callChunksRef.current = [];
+
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          callChunksRef.current.push(event.data);
+        }
+      };
+
+      let processingStarted = false;
+
+      const finishAndProcessRecording = () => {
+        if (processingStarted) return;
+        processingStarted = true;
+        finishCallRecordingRef.current = null;
+        if (callVadIntervalRef.current) {
+          clearInterval(callVadIntervalRef.current);
+          callVadIntervalRef.current = null;
+        }
+        setCallAudioLevel(0);
+        if (recorder && recorder.state !== 'inactive') {
+          try { recorder.stop(); } catch (e) {}
+        }
+      };
+
+      finishCallRecordingRef.current = finishAndProcessRecording;
+
+      recorder.onstop = async () => {
+        if (callStatusRef.current !== 'connected') return;
+
+        // Couper les pistes micro pour la règle anti-larsen dès l'arrêt complet
+        if (callStreamRef.current) {
+          callStreamRef.current.getAudioTracks().forEach(t => { t.enabled = false; });
+        }
+
+        const actualMime = recorder.mimeType || mimeType || 'audio/webm';
+        const audioBlob = new Blob(callChunksRef.current, { type: actualMime });
+
+        if (audioBlob.size > 200) {
+          await handleCallAudioExchange(audioBlob, extension);
+        } else {
+          // Si rien d'audible n'a été enregistré, relancer l'écoute
+          if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
+            startCallListening();
+          }
+        }
+      };
+
+      recorder.start(200);
+
+      // Boucle VAD : vérification d'activité toutes les 50 ms si analyserNode disponible
+      let speechStarted = false;
+      let speechStartTime = 0;
+      let lastSpeechTime = 0;
+      const recordingStartTime = Date.now();
+      const timeData = analyserNode ? new Uint8Array(analyserNode.fftSize) : null;
+
+      callVadIntervalRef.current = setInterval(() => {
+        if (callStatusRef.current !== 'connected' || callIsMutedRef.current) {
+          finishAndProcessRecording();
+          return;
+        }
+
+        let isSpeaking = false;
+        if (analyserNode && timeData) {
+          analyserNode.getByteTimeDomainData(timeData);
+          let sumSquares = 0;
+          for (let i = 0; i < timeData.length; i++) {
+            const norm = (timeData[i] - 128) / 128;
+            sumSquares += norm * norm;
+          }
+          const rms = Math.sqrt(sumSquares / timeData.length);
+          const level = Math.min(100, Math.round(rms * 500));
+          setCallAudioLevel(level);
+          isSpeaking = rms > VAD_SILENCE_THRESHOLD;
+        }
+
+        const now = Date.now();
+
+        if (isSpeaking) {
+          if (!speechStarted) {
+            speechStarted = true;
+            speechStartTime = now;
+          }
+          lastSpeechTime = now;
+        }
+
+        // Condition A : Silence détecté après une prise de parole valide
+        if (speechStarted && (now - lastSpeechTime >= VAD_SILENCE_DURATION_MS)) {
+          const totalSpeechDuration = lastSpeechTime - speechStartTime;
+          if (totalSpeechDuration >= VAD_MIN_SPEECH_DURATION_MS) {
+            finishAndProcessRecording();
+            return;
+          } else {
+            speechStarted = false;
+          }
+        }
+
+        // Condition B : Durée maximale d'enregistrement atteinte (15s)
+        if (now - recordingStartTime >= VAD_MAX_RECORDING_MS) {
+          finishAndProcessRecording();
+          return;
+        }
+      }, VAD_POLL_INTERVAL_MS);
+
+    } catch (err) {
+      console.warn("Erreur accès micro en mode appel:", err);
+      updateCallAgentState('error');
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        alert("Accès au microphone refusé. Veuillez autoriser le micro dans votre navigateur.");
+      }
+      endCall();
+    }
+  };
+
+  // Traitement audio de l'échange : Whisper -> Qwen (/api/call/answer) -> Piper TTS
+  const handleCallAudioExchange = async (audioBlob, extension) => {
+    if (callStatusRef.current !== 'connected') return;
+
+    updateCallAgentState('transcribing');
+
+    try {
+      // 1. Transcription Whisper.cpp CUDA locale
+      const formData = new FormData();
+      formData.append('file', audioBlob, `speech_call.${extension}`);
+
+      const transRes = await fetch('/api/transcribe', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!transRes.ok) {
+        throw new Error(`Erreur transcription ${transRes.status}`);
+      }
+
+      const transData = await transRes.json();
+      const transcript = transData.transcript?.trim();
+
+      if (!transcript) {
+        // Aucune parole claire identifiée, relancer l'écoute
+        if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
+          startCallListening();
+        }
+        return;
+      }
+
+      setCallUserSpoken(transcript);
+      updateCallAgentState('thinking');
+      setCallHistory((prev) => [...prev, { role: 'user', text: transcript }]);
+
+      // 2. Génération de la réponse bancaire orale synthétique
+      const ansRes = await fetch('/api/call/answer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, voice: callVoice })
+        body: JSON.stringify({ question: transcript, voice: callVoice })
       });
-      if (!res.ok) throw new Error("Erreur de réponse");
-      const data = await res.json();
-      await speakAgentCall(data.answer);
+
+      if (!ansRes.ok) {
+        throw new Error(`Erreur génération réponse ${ansRes.status}`);
+      }
+
+      const ansData = await ansRes.json();
+      await speakAgentCall(ansData.answer);
+
     } catch (e) {
-      console.error("Erreur serveur appel:", e);
-      await speakAgentCall("Veuillez m'excuser, une petite interruption est survenue. Pourriez-vous répéter votre question s'il vous plaît ?");
-    }
-  };
-
-  const endCall = () => {
-    callStatusRef.current = 'idle';
-    setCallStatus('idle');
-    setCallAgentState('idle');
-    setCallUserSpoken('');
-    setCallAgentSpoken('');
-
-    if (callTimerRef.current) {
-      clearInterval(callTimerRef.current);
-      callTimerRef.current = null;
-    }
-    if (callAudioRef.current) {
-      callAudioRef.current.pause();
-      callAudioRef.current = null;
-    }
-    if (callRecognitionRef.current) {
-      try { callRecognitionRef.current.abort(); } catch (e) {}
-    }
-  };
-
-  const toggleCallMute = () => {
-    const nextMute = !callIsMuted;
-    setCallIsMuted(nextMute);
-    callIsMutedRef.current = nextMute;
-    if (nextMute) {
-      if (callRecognitionRef.current) {
-        try { callRecognitionRef.current.abort(); } catch (e) {}
-      }
-      setCallAgentState('idle');
-    } else {
+      console.error("Erreur serveur échange vocal appel:", e);
       if (callStatusRef.current === 'connected') {
-        startCallListening();
+        await speakAgentCall("Veuillez m'excuser, une petite difficulté technique est survenue. Pourriez-vous répéter votre question s'il vous plaît ?");
       }
     }
   };
+
+  // Nettoyage complet au démontage du composant
+  useEffect(() => {
+    return () => {
+      endCall();
+      stopClassicRecording();
+      if (chatAudioPlayerRef.current) {
+        chatAudioPlayerRef.current.pause();
+      }
+      if (chatAudioUrlRef.current) {
+        URL.revokeObjectURL(chatAudioUrlRef.current);
+      }
+    };
+  }, []);
 
   return (
     <div className="app-container">
       
-      {/* Audio player invisible */}
-      <audio ref={audioPlayerRef} style={{ display: 'none' }} />
+      {/* Audio players invisibles pour la synthèse vocale */}
+      <audio ref={chatAudioPlayerRef} style={{ display: 'none' }} />
+      <audio ref={callAudioPlayerRef} style={{ display: 'none' }} />
 
       {/* 1. TOP BAR BANCOBU VERTE (#4ba452) */}
       <div style={{ backgroundColor: '#4ba452', color: '#ffffff', fontSize: '0.8rem', padding: '5px 0', borderBottom: '1px solid rgba(0,0,0,0.05)' }}>
@@ -614,14 +967,14 @@ export default function App() {
             {/* Bannière Hero Style BANCOBU */}
             <div className="presentation-hero" style={{ backgroundColor: '#ffffff', borderRadius: '16px', padding: '40px 30px', boxShadow: '0 4px 20px rgba(0,0,0,0.05)', border: '1px solid #e2e8f0', marginBottom: '30px', textAlign: 'center' }}>
               <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '5px 14px', borderRadius: '20px', backgroundColor: '#eef7ee', color: '#4ba452', border: '1px solid #c2e2c4', fontWeight: 700, fontSize: '0.82rem', marginBottom: '16px' }}>
-                <Sparkles size={14} /> Innovation Bancaire : Voix & IA RAG
+                <Sparkles size={14} /> Innovation Bancaire : Voix & IA RAG 100% Locale
               </div>
               <h1 className="presentation-title" style={{ fontSize: '2.2rem', fontWeight: 800, color: '#1a202c', marginBottom: '14px', lineHeight: 1.25 }}>
                 L'Intelligence Artificielle & la Voix au Cœur de la <br />
                 <span style={{ color: '#4ba452' }}>Relation Client BANCOBU</span>
               </h1>
               <p className="presentation-desc" style={{ fontSize: '1.05rem', color: '#4a5568', maxWidth: '750px', margin: '0 auto 24px', lineHeight: 1.6 }}>
-                Posez vos questions à la voix ou par écrit, et écoutez les réponses naturelles d'un conseiller virtuel, certifiées et sourcées à partir de la documentation officielle de la BANCOBU.
+                Posez vos questions à la voix ou par écrit, et écoutez les réponses naturelles d'une conseillère virtuelle, certifiées et sourcées à partir de la documentation officielle de la BANCOBU, opérée à 100% sur NVIDIA Jetson Orin Nano.
               </p>
               <div style={{ display: 'flex', justifyContent: 'center' }}>
                 <button
@@ -647,11 +1000,11 @@ export default function App() {
               </div>
             </div>
 
-            {/* Grille Piliers Technologiques */}
+            {/* Grille Piliers Technologiques Locaux */}
             <div style={{ marginBottom: '30px' }}>
               <div style={{ textAlign: 'center', marginBottom: '24px' }}>
-                <h2 style={{ fontSize: '1.4rem', fontWeight: 700, color: '#2d3748' }}>Une Chaîne Technologique Complète</h2>
-                <p style={{ color: '#718096', fontSize: '0.9rem' }}>De la reconnaissance vocale à la synthèse audio haute fidélité</p>
+                <h2 style={{ fontSize: '1.4rem', fontWeight: 700, color: '#2d3748' }}>Une Chaîne Technologique 100% Locale</h2>
+                <p style={{ color: '#718096', fontSize: '0.9rem' }}>De la reconnaissance vocale Whisper CUDA à la synthèse vocale Piper sur Jetson Orin Nano</p>
               </div>
 
               <div className="tech-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '16px' }}>
@@ -659,9 +1012,9 @@ export default function App() {
                   <div style={{ width: '40px', height: '40px', borderRadius: '8px', backgroundColor: '#eef7ee', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '14px' }}>
                     <Mic size={20} style={{ color: '#4ba452' }} />
                   </div>
-                  <h3 style={{ fontSize: '1rem', fontWeight: 700, color: '#2d3748', marginBottom: '6px' }}>1. Entrée Vocale Omnicanale</h3>
+                  <h3 style={{ fontSize: '1rem', fontWeight: 700, color: '#2d3748', marginBottom: '6px' }}>1. Entrée Vocale Locale (Whisper.cpp)</h3>
                   <p style={{ fontSize: '0.85rem', color: '#718096', lineHeight: 1.5 }}>
-                    Transcrit la parole instantanément depuis PC, tablette ou smartphone.
+                    Transcrit la parole instantanément avec Whisper.cpp Small accéléré par CUDA directement sur le GPU Jetson.
                   </p>
                 </div>
 
@@ -671,7 +1024,7 @@ export default function App() {
                   </div>
                   <h3 style={{ fontSize: '1rem', fontWeight: 700, color: '#2d3748', marginBottom: '6px' }}>2. Recherche Sémantique Qdrant</h3>
                   <p style={{ fontSize: '0.85rem', color: '#718096', lineHeight: 1.5 }}>
-                    Localise les articles exacts dans <code>bancobu_donnees.pdf</code> en quelques millisecondes.
+                    Localise les extraits vérifiés dans <code>bancobu_donnees.pdf</code> avec EmbeddingGemma local en quelques millisecondes.
                   </p>
                 </div>
 
@@ -679,9 +1032,9 @@ export default function App() {
                   <div style={{ width: '40px', height: '40px', borderRadius: '8px', backgroundColor: '#fffaf0', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '14px' }}>
                     <Cpu size={20} style={{ color: '#de6906' }} />
                   </div>
-                  <h3 style={{ fontSize: '1rem', fontWeight: 700, color: '#2d3748', marginBottom: '6px' }}>3. Raisonnement Gemini</h3>
+                  <h3 style={{ fontSize: '1rem', fontWeight: 700, color: '#2d3748', marginBottom: '6px' }}>3. Raisonnement Qwen 2.5 3B</h3>
                   <p style={{ fontSize: '0.85rem', color: '#718096', lineHeight: 1.5 }}>
-                    Rédige une réponse claire, polie et certifiée respectant les directives bancaires.
+                    Rédige une réponse certifiée conforme aux documents officiels sans aucune fuite vers le cloud.
                   </p>
                 </div>
 
@@ -689,9 +1042,9 @@ export default function App() {
                   <div style={{ width: '40px', height: '40px', borderRadius: '8px', backgroundColor: '#eef7ee', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '14px' }}>
                     <Volume2 size={20} style={{ color: '#4ba452' }} />
                   </div>
-                  <h3 style={{ fontSize: '1rem', fontWeight: 700, color: '#2d3748', marginBottom: '6px' }}>4. Voix Neuronale Naturelle</h3>
+                  <h3 style={{ fontSize: '1rem', fontWeight: 700, color: '#2d3748', marginBottom: '6px' }}>4. Synthèse Vocale Piper TTS</h3>
                   <p style={{ fontSize: '0.85rem', color: '#718096', lineHeight: 1.5 }}>
-                    Génération audio MP3 fluide avec voix de conseiller francophone naturelle (Edge-TTS).
+                    Génération audio WAV fluide avec la voix française naturelle Siwis (100% autonome et locale).
                   </p>
                 </div>
               </div>
@@ -705,7 +1058,7 @@ export default function App() {
             {/* Carte Principale Appel */}
             <div style={{ backgroundColor: '#ffffff', borderRadius: '20px', border: '1px solid #e2e8f0', boxShadow: '0 8px 30px rgba(0,0,0,0.06)', padding: '28px 20px', textAlign: 'center' }}>
               
-              {/* En-tête statut de la ligne & sélection du conseiller */}
+              {/* En-tête statut de la ligne & sélection de la conseillère */}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', borderBottom: '1px solid #f0f4f8', paddingBottom: '16px', marginBottom: '24px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                   <span style={{ 
@@ -723,38 +1076,22 @@ export default function App() {
 
                 {/* Sélecteur de Voix */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <span style={{ fontSize: '0.8rem', color: '#64748b', fontWeight: 600 }}>Conseiller :</span>
+                  <span style={{ fontSize: '0.8rem', color: '#64748b', fontWeight: 600 }}>Conseillère :</span>
                   <button
                     disabled={callStatus === 'connected'}
-                    onClick={() => setCallVoice('fr-FR-DeniseNeural')}
+                    onClick={() => setCallVoice('siwis')}
                     style={{
-                      padding: '4px 10px',
+                      padding: '4px 12px',
                       borderRadius: '14px',
                       fontSize: '0.78rem',
                       fontWeight: 600,
-                      border: callVoice === 'fr-FR-DeniseNeural' ? '2px solid #4ba452' : '1px solid #cbd5e1',
-                      backgroundColor: callVoice === 'fr-FR-DeniseNeural' ? '#eef7ee' : '#ffffff',
-                      color: callVoice === 'fr-FR-DeniseNeural' ? '#3d8a43' : '#64748b',
-                      cursor: callStatus === 'connected' ? 'default' : 'pointer',
+                      border: '2px solid #4ba452',
+                      backgroundColor: '#eef7ee',
+                      color: '#3d8a43',
+                      cursor: 'default',
                     }}
                   >
-                    👩 Denise
-                  </button>
-                  <button
-                    disabled={callStatus === 'connected'}
-                    onClick={() => setCallVoice('fr-FR-HenriNeural')}
-                    style={{
-                      padding: '4px 10px',
-                      borderRadius: '14px',
-                      fontSize: '0.78rem',
-                      fontWeight: 600,
-                      border: callVoice === 'fr-FR-HenriNeural' ? '2px solid #0080fe' : '1px solid #cbd5e1',
-                      backgroundColor: callVoice === 'fr-FR-HenriNeural' ? '#eff6ff' : '#ffffff',
-                      color: callVoice === 'fr-FR-HenriNeural' ? '#0066cc' : '#64748b',
-                      cursor: callStatus === 'connected' ? 'default' : 'pointer',
-                    }}
-                  >
-                    👨 Henri
+                    👩 Siwis (Conseillère BANCOBU - Voix Locale)
                   </button>
                 </div>
               </div>
@@ -778,10 +1115,10 @@ export default function App() {
                     <PhoneCall size={44} />
                   </div>
                   <h2 style={{ fontSize: '1.45rem', fontWeight: 800, color: '#1e293b', marginBottom: '8px' }}>
-                    Parler avec votre Conseiller BANCOBU
+                    Parler avec votre Conseillère BANCOBU
                   </h2>
                   <p style={{ color: '#64748b', fontSize: '0.92rem', maxWidth: '520px', margin: '0 auto 26px', lineHeight: 1.55 }}>
-                    Lancez un appel en direct pour poser toutes vos questions oralement. Le système écoute et répond en continu en mains-libres, sans avoir besoin d'appuyer sur aucun bouton.
+                    Lancez un appel en direct pour poser toutes vos questions oralement. Le système écoute et répond en continu en mains-libres, avec détection automatique de parole et synthèse locale.
                   </p>
                   <button
                     onClick={startCall}
@@ -811,10 +1148,10 @@ export default function App() {
               {callStatus === 'connected' && (
                 <div style={{ padding: '10px 0' }}>
                   
-                  {/* Visuel dynamique au centre */}
+                  {/* Visuel dynamique d'état de l'agent */}
                   <div style={{ minHeight: '130px', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '20px' }}>
                     {callAgentState === 'speaking' && (
-                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px' }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '6px', height: '50px' }}>
                           <span className="call-wave-bar" />
                           <span className="call-wave-bar" />
@@ -825,28 +1162,106 @@ export default function App() {
                           <span className="call-wave-bar" />
                         </div>
                         <span style={{ fontSize: '0.9rem', fontWeight: 700, color: '#16a34a' }}>
-                          Le conseiller vous répond oralement...
+                          La conseillère vous répond oralement...
                         </span>
+                        <button
+                          onClick={handleCallInterrupt}
+                          style={{
+                            backgroundColor: '#16a34a',
+                            color: '#ffffff',
+                            border: 'none',
+                            padding: '9px 20px',
+                            borderRadius: '24px',
+                            fontWeight: 700,
+                            fontSize: '0.86rem',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '7px',
+                            cursor: 'pointer',
+                            boxShadow: '0 4px 14px rgba(22, 163, 74, 0.35)',
+                            marginTop: '2px'
+                          }}
+                        >
+                          <Mic size={16} /> Prendre la parole maintenant
+                        </button>
                       </div>
                     )}
 
-                    {callAgentState === 'listening' && (
+                    {callAgentState === 'recording' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px' }}>
+                        <div 
+                          onClick={triggerCallFinish}
+                          title="Cliquez pour envoyer votre question immédiatement"
+                          className="call-radar" 
+                          style={{
+                            width: '80px',
+                            height: '80px',
+                            borderRadius: '50%',
+                            backgroundColor: '#eef7ee',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            color: '#16a34a',
+                            border: `3px solid ${callAudioLevel > 15 ? '#16a34a' : '#86efac'}`,
+                            boxShadow: `0 0 ${8 + callAudioLevel / 3}px rgba(22, 163, 74, 0.45)`,
+                            cursor: 'pointer',
+                            transition: 'all 0.15s ease'
+                          }}
+                        >
+                          <Mic size={38} />
+                        </div>
+
+                        {/* Indicateur de volume et statut */}
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px' }}>
+                          <span style={{ fontSize: '0.92rem', fontWeight: 700, color: '#16a34a' }}>
+                            {callAudioLevel > 15 ? "Voix détectée..." : "À vous la parole, je vous écoute..."}
+                          </span>
+                          <div style={{ width: '130px', height: '6px', backgroundColor: '#e2e8f0', borderRadius: '3px', overflow: 'hidden' }}>
+                            <div style={{ width: `${Math.min(100, Math.max(6, callAudioLevel))}%`, height: '100%', backgroundColor: '#16a34a', transition: 'width 0.08s ease' }} />
+                          </div>
+                        </div>
+
+                        {/* Bouton explicite d'envoi immédiat */}
+                        <button
+                          onClick={triggerCallFinish}
+                          style={{
+                            backgroundColor: '#16a34a',
+                            color: '#ffffff',
+                            border: 'none',
+                            padding: '10px 22px',
+                            borderRadius: '24px',
+                            fontWeight: 700,
+                            fontSize: '0.88rem',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            cursor: 'pointer',
+                            boxShadow: '0 4px 14px rgba(22, 163, 74, 0.35)',
+                            marginTop: '2px'
+                          }}
+                        >
+                          <CheckCircle size={16} /> J'ai fini de parler (Envoyer)
+                        </button>
+                      </div>
+                    )}
+
+                    {callAgentState === 'transcribing' && (
                       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px' }}>
-                        <div className="call-radar" style={{
-                          width: '74px',
-                          height: '74px',
+                        <div style={{
+                          width: '64px',
+                          height: '64px',
                           borderRadius: '50%',
-                          backgroundColor: '#eef7ee',
+                          backgroundColor: '#eff6ff',
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'center',
-                          color: '#16a34a',
-                          border: '2px solid #86efac'
+                          color: '#0080fe',
+                          animation: 'pulse 1s infinite'
                         }}>
-                          <Mic size={34} />
+                          <Mic size={30} />
                         </div>
-                        <span style={{ fontSize: '0.9rem', fontWeight: 700, color: '#16a34a' }}>
-                          À vous la parole, le conseiller vous écoute...
+                        <span style={{ fontSize: '0.9rem', fontWeight: 700, color: '#0080fe' }}>
+                          Transcription vocale Whisper.cpp en cours...
                         </span>
                       </div>
                     )}
@@ -872,7 +1287,7 @@ export default function App() {
                       </div>
                     )}
 
-                    {callAgentState === 'idle' && (
+                    {callAgentState === 'requesting_permission' && (
                       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px' }}>
                         <div style={{
                           width: '64px',
@@ -884,10 +1299,57 @@ export default function App() {
                           justifyContent: 'center',
                           color: '#64748b'
                         }}>
-                          <PhoneCall size={28} />
+                          <Mic size={28} />
                         </div>
                         <span style={{ fontSize: '0.9rem', fontWeight: 600, color: '#64748b' }}>
-                          Ligne active
+                          Activation du microphone...
+                        </span>
+                      </div>
+                    )}
+
+                    {callAgentState === 'error' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px' }}>
+                        <div style={{
+                          width: '64px',
+                          height: '64px',
+                          borderRadius: '50%',
+                          backgroundColor: '#fee2e2',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          color: '#dc2626'
+                        }}>
+                          <MicOff size={28} />
+                        </div>
+                        <span style={{ fontSize: '0.9rem', fontWeight: 700, color: '#dc2626' }}>
+                          Erreur de communication audio
+                        </span>
+                      </div>
+                    )}
+
+                    {callAgentState === 'idle' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px' }}>
+                        <button
+                          onClick={startCallListening}
+                          style={{
+                            backgroundColor: '#16a34a',
+                            color: '#ffffff',
+                            border: 'none',
+                            padding: '12px 28px',
+                            borderRadius: '28px',
+                            fontWeight: 700,
+                            fontSize: '0.98rem',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '10px',
+                            cursor: 'pointer',
+                            boxShadow: '0 4px 16px rgba(22, 163, 74, 0.35)',
+                          }}
+                        >
+                          <Mic size={20} /> Appuyer pour parler
+                        </button>
+                        <span style={{ fontSize: '0.84rem', color: '#64748b' }}>
+                          Ligne active • Cliquez sur le bouton ou parlez directement
                         </span>
                       </div>
                     )}
@@ -906,9 +1368,9 @@ export default function App() {
                     justifyContent: 'center',
                     textAlign: 'center'
                   }}>
-                    {callAgentState === 'listening' ? (
+                    {callAgentState === 'recording' || callAgentState === 'transcribing' ? (
                       <p style={{ fontStyle: callUserSpoken ? 'normal' : 'italic', color: callUserSpoken ? '#1e293b' : '#94a3b8', fontSize: '0.96rem' }}>
-                        {callUserSpoken ? `« ${callUserSpoken} »` : "Parlez dans votre microphone..."}
+                        {callUserSpoken ? `« ${callUserSpoken} »` : "Parlez librement, ou cliquez sur 'Envoyer' dès que vous avez fini..."}
                       </p>
                     ) : (
                       <p style={{ color: '#334155', fontSize: '0.94rem', lineHeight: 1.55 }}>
@@ -917,8 +1379,34 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* Barre de contrôle d'appel (Raccrocher / Mute) */}
-                  <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '16px' }}>
+                  {/* Barre de contrôle d'appel (Interrompre / Mute / Raccrocher) */}
+                  <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
+                    
+                    {/* Bouton d'interruption explicite pendant que le conseiller parle (barge-in) */}
+                    {callAgentState === 'speaking' && (
+                      <button
+                        onClick={handleCallInterrupt}
+                        style={{
+                          backgroundColor: '#f59e0b',
+                          color: '#ffffff',
+                          border: 'none',
+                          padding: '11px 22px',
+                          borderRadius: '24px',
+                          fontWeight: 700,
+                          fontSize: '0.9rem',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '7px',
+                          cursor: 'pointer',
+                          boxShadow: '0 4px 14px rgba(245, 158, 11, 0.35)',
+                          transition: 'all 0.2s ease'
+                        }}
+                      >
+                        <Square size={14} />
+                        Interrompre la réponse
+                      </button>
+                    )}
+
                     <button
                       onClick={toggleCallMute}
                       style={{
@@ -988,7 +1476,7 @@ export default function App() {
                       }}
                     >
                       <span style={{ fontWeight: 700, fontSize: '0.75rem', color: item.role === 'user' ? '#16a34a' : '#0066cc', display: 'block', marginBottom: '2px' }}>
-                        {item.role === 'user' ? 'Vous' : `Conseiller BANCOBU (${callVoice.includes('Denise') ? 'Denise' : 'Henri'})`}
+                        {item.role === 'user' ? 'Vous' : 'Conseillère BANCOBU (Siwis)'}
                       </span>
                       {item.text}
                     </div>
@@ -1122,7 +1610,7 @@ export default function App() {
                     <Mic size={18} style={{ color: '#ffffff' }} />
                   </div>
                   <div style={{ padding: '10px 14px', borderRadius: '4px 16px 16px 16px', backgroundColor: '#ffffff', border: '1px solid #cbd5e0', display: 'flex', alignItems: 'center', gap: '8px', boxShadow: '0 2px 6px rgba(0,0,0,0.04)' }}>
-                    <span style={{ fontSize: '0.82rem', color: '#2d3748', fontWeight: 600 }}>Transcription vocale en cours...</span>
+                    <span style={{ fontSize: '0.82rem', color: '#2d3748', fontWeight: 600 }}>Transcription vocale Whisper.cpp en cours...</span>
                     <div style={{ display: 'flex', gap: '3px' }}>
                       <span style={{ width: '5px', height: '5px', borderRadius: '50%', backgroundColor: '#0080fe', animation: 'pulse 1s infinite' }}></span>
                     </div>
@@ -1171,6 +1659,48 @@ export default function App() {
 
             {/* Barre de saisie avec bouton Micro Vocal */}
             <div style={{ marginTop: '8px' }}>
+              {/* Bannière active pendant l'enregistrement micro */}
+              {isRecording && (
+                <div style={{
+                  backgroundColor: '#fee2e2',
+                  border: '1.5px solid #ef4444',
+                  color: '#991b1b',
+                  padding: '9px 14px',
+                  borderRadius: '12px',
+                  marginBottom: '10px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '10px',
+                  boxShadow: '0 4px 12px rgba(239, 68, 68, 0.2)'
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.88rem', fontWeight: 700 }}>
+                    <span style={{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#ef4444', display: 'inline-block', animation: 'pulse 1s infinite' }} />
+                    Micro actif : parlez maintenant...
+                  </div>
+                  <button
+                    type="button"
+                    onClick={stopClassicRecording}
+                    style={{
+                      backgroundColor: '#dc2626',
+                      color: '#ffffff',
+                      border: 'none',
+                      borderRadius: '20px',
+                      padding: '7px 16px',
+                      fontSize: '0.84rem',
+                      fontWeight: 700,
+                      cursor: 'pointer',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                      boxShadow: '0 2px 8px rgba(220, 38, 38, 0.4)'
+                    }}
+                  >
+                    <CheckCircle size={15} /> Valider & Envoyer
+                  </button>
+                </div>
+              )}
+
               <form 
                 onSubmit={(e) => { e.preventDefault(); handleSend(); }}
                 className="input-form"
@@ -1184,7 +1714,7 @@ export default function App() {
                   type="button"
                   onClick={toggleRecording}
                   className="mic-button"
-                  title={isRecording ? "Arrêter l'enregistrement (cliquez pour terminer)" : "Parler au micro"}
+                  title={isRecording ? "Arrêter l'enregistrement et envoyer" : "Parler au micro"}
                   style={{
                     backgroundColor: isRecording ? '#ef4444' : '#eef7ee',
                     color: isRecording ? '#ffffff' : '#4ba452',
@@ -1208,8 +1738,8 @@ export default function App() {
                   type="text"
                   placeholder={
                     isRecording 
-                      ? "🔴 Enregistrement en cours... Cliquez à nouveau pour envoyer" 
-                      : (isTranscribing ? "Transcription vocale..." : "Écrivez ou touchez le micro pour parler...")
+                      ? "🔴 Parlez dans votre micro... Cliquez sur Envoyer pour valider" 
+                      : (isTranscribing ? "Transcription Whisper.cpp en cours sur Jetson..." : "Écrivez ou touchez le micro pour parler...")
                   }
                   value={inputQuestion}
                   onChange={(e) => setInputQuestion(e.target.value)}
@@ -1219,20 +1749,21 @@ export default function App() {
 
                 <button
                   type="submit"
-                  disabled={!inputQuestion.trim() || isLoading || isTranscribing}
+                  disabled={(!isRecording && !inputQuestion.trim()) || isLoading || isTranscribing}
                   className="send-button"
                   style={{
-                    cursor: !inputQuestion.trim() || isLoading || isTranscribing ? 'not-allowed' : 'pointer',
-                    opacity: !inputQuestion.trim() || isLoading || isTranscribing ? 0.6 : 1,
+                    backgroundColor: isRecording ? '#dc2626' : undefined,
+                    cursor: (!isRecording && !inputQuestion.trim()) || isLoading || isTranscribing ? 'not-allowed' : 'pointer',
+                    opacity: (!isRecording && !inputQuestion.trim()) || isLoading || isTranscribing ? 0.6 : 1,
                   }}
                 >
-                  <span className="send-button-text">Envoyer</span>
-                  <Send size={14} />
+                  <span className="send-button-text">{isRecording ? "Envoyer l'audio" : "Envoyer"}</span>
+                  {isRecording ? <CheckCircle size={14} /> : <Send size={14} />}
                 </button>
               </form>
 
               <div className="chat-disclaimer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '8px', fontSize: '0.72rem', color: '#718096', padding: '0 4px' }}>
-                <span>BANCOBU AI • Conseiller Virtuel Officiel</span>
+                <span>BANCOBU AI • Conseillère Virtuelle Officielle</span>
                 <span>Siège Social : Boulevard de la Liberté, Bujumbura • Tél: +257 22 26 52 00</span>
               </div>
             </div>

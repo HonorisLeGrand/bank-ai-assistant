@@ -3,61 +3,51 @@ import sys
 import re
 import tempfile
 import asyncio
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+import ollama
 from qdrant_client import QdrantClient
-import edge_tts
+
+# ==============================================================================
+# CONFIGURATION 100% LOCALE (NVIDIA JETSON ORIN NANO)
+# ==============================================================================
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
-VOICE_NAME = "fr-FR-HenriNeural" # Voix masculine française chaleureuse et professionnelle
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "embeddinggemma")
 
-# Modèles Gemini avec repli automatique en cas de 503 UNAVAILABLE ou 429
-AVAILABLE_MODELS = [
-    "gemini-3.1-flash-lite", # Modèle ultra-rapide (< 2 secondes)
-    "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
-    "gemini-3.5-flash",
-]
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "bancobu_documents_ollama")
+QDRANT_PATH = os.getenv("QDRANT_PATH", "./qdrant_data")
+TOP_K = int(os.getenv("TOP_K", "4"))
+SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "0.35"))
 
-def generate_with_fallback(gemini, contents):
-    """Génère du contenu avec repli automatique si un modèle subit une surcharge 503."""
-    last_error = None
-    seen_models = set()
-    for model_name in AVAILABLE_MODELS:
-        if model_name in seen_models:
-            continue
-        seen_models.add(model_name)
-        try:
-            res = gemini.models.generate_content(
-                model=model_name,
-                contents=contents
-            )
-            if res and res.text:
-                return res.text.strip()
-        except Exception as e:
-            err_str = str(e)
-            print(f"⚠️ Modèle {model_name} indisponible ({err_str[:60]}), tentative avec modèle de repli...")
-            last_error = e
-            continue
-    raise last_error or Exception("Tous les modèles Gemini sont temporairement indisponibles.")
+WHISPER_CLI_PATH = os.getenv("WHISPER_CLI_PATH", "/mnt/usb/whisper/whisper.cpp/build/bin/whisper-cli")
+WHISPER_MODEL_PATH = os.getenv("WHISPER_MODEL_PATH", "/mnt/usb/whisper-models/ggml-small.bin")
 
-COLLECTION_NAME = "bancobu_documents"
-QDRANT_PATH = "./qdrant_data"
-TOP_K = 3
+PIPER_BIN_PATH = os.getenv("PIPER_BIN_PATH", "/mnt/usb/piper/venv/bin/piper")
+PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "/mnt/usb/piper/models/fr_FR-siwis-medium.onnx")
+PIPER_CONFIG_PATH = os.getenv("PIPER_CONFIG_PATH", "/mnt/usb/piper/models/fr_FR-siwis-medium.onnx.json")
 
 GREETINGS = {"bonjour", "salut", "hello", "bonsoir", "coucou", "yo", "aide", "aidez moi", "bonjour bancobu"}
 
-app = FastAPI(title="BANCOBU AI Assistant API", version="1.0.0")
+STRICT_FALLBACK_TEXT = "Cette information n'est pas précisée dans nos documents bancaires officiels. Je vous invite à contacter votre agence BANCOBU."
+
+# ==============================================================================
+# APPLICATION FASTAPI
+# ==============================================================================
+
+app = FastAPI(
+    title="BANCOBU AI Assistant API (100% Local Jetson Orin Nano)",
+    version="2.1.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,30 +57,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-gemini_client = None
+# Clients locaux (initialisation paresseuse)
+ollama_client = None
 qdrant_client = None
 
-def get_gemini():
-    global gemini_client
-    if gemini_client is None:
-        if not GEMINI_API_KEY:
-            raise ValueError("GEMINI_API_KEY absente du fichier .env")
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY, http_options={"timeout": 60000})
-    return gemini_client
+def get_ollama() -> ollama.Client:
+    global ollama_client
+    if ollama_client is None:
+        ollama_client = ollama.Client(host=OLLAMA_HOST)
+    return ollama_client
 
-def get_qdrant():
+def get_qdrant() -> QdrantClient:
     global qdrant_client
     if qdrant_client is None:
         qdrant_client = QdrantClient(path=QDRANT_PATH)
     return qdrant_client
 
+# ==============================================================================
+# SCHÉMAS PYDANTIC (RÉTROCOMPATIBLES AVEC SUPPORT D'HISTORIQUE OPTIONNEL)
+# ==============================================================================
+
+class MessageTurn(BaseModel):
+    role: str
+    content: str
+
 class QuestionRequest(BaseModel):
     question: str
+    history: Optional[List[Dict[str, Any]]] = None
 
 class SourceItem(BaseModel):
     source: str
     page: int
     text: str
+    score: Optional[float] = None
 
 class AnswerResponse(BaseModel):
     answer: str
@@ -98,29 +97,118 @@ class AnswerResponse(BaseModel):
 
 class TTSRequest(BaseModel):
     text: str
-    voice: Optional[str] = "fr-FR-DeniseNeural"
+    voice: Optional[str] = "siwis"
 
 class CallRequest(BaseModel):
     question: str
-    voice: Optional[str] = "fr-FR-DeniseNeural"
+    voice: Optional[str] = "siwis"
+    history: Optional[List[Dict[str, Any]]] = None
+
+# ==============================================================================
+# FONCTIONS UTILITAIRES RAG (EMBEDDINGS & GÉNÉRATION OLLAMA)
+# ==============================================================================
+
+def get_embedding(text: str) -> List[float]:
+    """Calcule l'embedding local via Ollama (modèle EmbeddingGemma)."""
+    client = get_ollama()
+    response = client.embed(
+        model=EMBEDDING_MODEL,
+        input=text
+    )
+    return response["embeddings"][0]
+
+def normalize_banking_query(query: str) -> str:
+    """Harmonise le langage familier vers la terminologie bancaire officielle BANCOBU."""
+    q = query
+    # "créer un compte" / "faire un compte" -> "ouvrir un compte"
+    q = re.sub(r'\b(cr[ée]{1,2}r|faire|avoir)\s+un\s+compte\b', 'ouvrir un compte', q, flags=re.IGNORECASE)
+    q = re.sub(r'\bcr[ée]{1,2}ation\s+d[e\']\s*un?\s*compte\b', 'ouverture de compte', q, flags=re.IGNORECASE)
+    # "prendre une carte" / "commander une carte" -> "obtenir une carte bancaire"
+    q = re.sub(r'\b(prendre|commander|avoir)\s+une\s+carte\b', 'obtenir une carte bancaire', q, flags=re.IGNORECASE)
+    return q
+
+def search_documents(query_vector: List[float], limit: int = TOP_K):
+    """Recherche les passages pertinents dans Qdrant en éliminant les micro-fragments non informatifs."""
+    client = get_qdrant()
+    results = client.query_points(
+        collection_name=COLLECTION_NAME,
+        query=query_vector,
+        limit=limit + 3,
+        with_payload=True
+    )
+    # Filtrer les fragments vides ou résiduels (< 20 caractères comme 'End')
+    valid_points = [
+        p for p in results.points 
+        if len(str((p.payload or {}).get("text", "")).strip()) >= 20
+    ]
+    return valid_points[:limit]
+
+def generate_answer_ollama(prompt: str) -> str:
+    """Génère la réponse avec Qwen 2.5 3B local via Ollama."""
+    client = get_ollama()
+    response = client.generate(
+        model=LLM_MODEL,
+        prompt=prompt,
+        options={
+            "temperature": 0.1,
+            "top_p": 0.85,
+        }
+    )
+    return response.get("response", "").strip()
+
+# ==============================================================================
+# ENDPOINTS API
+# ==============================================================================
 
 @app.get("/api/health")
 def health():
+    """Diagnostic complet de l'état des composants locaux."""
+    ollama_ok = False
+    available_models = []
+    try:
+        client = get_ollama()
+        tags = client.list()
+        available_models = [m.model for m in tags.models] if hasattr(tags, 'models') else []
+        ollama_ok = True
+    except Exception as e:
+        available_models = [f"Erreur connexion Ollama: {str(e)}"]
+
+    qdrant_ok = False
+    points_count = 0
+    try:
+        q = get_qdrant()
+        info = q.get_collection(COLLECTION_NAME)
+        points_count = info.points_count
+        qdrant_ok = True
+    except Exception:
+        pass
+
+    whisper_present = Path(WHISPER_CLI_PATH).exists() and Path(WHISPER_MODEL_PATH).exists()
+    piper_present = Path(PIPER_BIN_PATH).exists() and Path(PIPER_MODEL_PATH).exists()
+
     return {
-        "status": "ok",
-        "gemini_model": GEMINI_MODEL,
+        "status": "ok" if (ollama_ok and qdrant_ok) else "degraded",
+        "architecture": "100% Local (NVIDIA Jetson Orin Nano)",
+        "ollama_host": OLLAMA_HOST,
+        "ollama_connected": ollama_ok,
+        "llm_model": LLM_MODEL,
         "embedding_model": EMBEDDING_MODEL,
         "collection": COLLECTION_NAME,
-        "tts_voice": VOICE_NAME
+        "collection_points": points_count,
+        "models_in_ollama": available_models,
+        "score_threshold": SCORE_THRESHOLD,
+        "whisper_cli_ready": whisper_present,
+        "piper_tts_ready": piper_present
     }
 
 @app.post("/api/ask", response_model=AnswerResponse)
 def ask_question(payload: QuestionRequest):
+    """Point d'entrée RAG complet avec vérification stricte de pertinence et anti-hallucination."""
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="La question ne peut pas être vide.")
 
-    # 0. Réponse immédiate pour les salutations courantes (< 10ms)
+    # 0. Réponse instantanée pour les salutations courantes (< 5ms)
     clean_q = re.sub(r'[^\w\s]', '', question.lower()).strip()
     if clean_q in GREETINGS:
         return AnswerResponse(
@@ -129,29 +217,33 @@ def ask_question(payload: QuestionRequest):
         )
 
     try:
-        gemini = get_gemini()
-        # 1. Embedding direct via Google Gemini
-        embed_resp = gemini.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=question,
-            config={"output_dimensionality": 768}
-        )
-        query_vector = embed_resp.embeddings[0].values
+        # 1. Normalisation et calcul de l'embedding de la question via EmbeddingGemma
+        search_query = normalize_banking_query(question)
+        query_vector = get_embedding(search_query)
 
         # 2. Recherche vectorielle dans Qdrant
-        client_qdrant = get_qdrant()
-        results = client_qdrant.query_points(
-            collection_name=COLLECTION_NAME,
-            query=query_vector,
-            limit=TOP_K,
-            with_payload=True
-        )
+        passages = search_documents(query_vector, limit=TOP_K)
 
-        passages = results.points
+        # 3. CONTRÔLE DE PERTINENCE DOCUMENTAIRE :
+        # Si aucun passage n'est trouvé ou si le score du meilleur passage est inférieur au seuil
+        if not passages or passages[0].score < SCORE_THRESHOLD:
+            return AnswerResponse(
+                answer=STRICT_FALLBACK_TEXT,
+                sources=[]
+            )
+
+        # Filtrer pour ne conserver que les extraits au-dessus du seuil
+        relevant_passages = [p for p in passages if p.score >= SCORE_THRESHOLD]
+        if not relevant_passages:
+            return AnswerResponse(
+                answer=STRICT_FALLBACK_TEXT,
+                sources=[]
+            )
+
         sources_list = []
         context = ""
 
-        for index, point in enumerate(passages, start=1):
+        for index, point in enumerate(relevant_passages, start=1):
             data = point.payload or {}
             source_file = str(data.get("source", "bancobu_donnees.pdf"))
             page_num = int(data.get("page", 1))
@@ -160,41 +252,33 @@ def ask_question(payload: QuestionRequest):
             sources_list.append(SourceItem(
                 source=source_file,
                 page=page_num,
-                text=chunk_text
+                text=chunk_text,
+                score=round(float(point.score), 4)
             ))
 
             context += f"""
-EXTRAIT {index}
-Document : {source_file}
-Page : {page_num}
-
-Contenu :
+EXTRAIT {index} (Document: {source_file}, Page: {page_num}) :
 {chunk_text}
-
 """
 
-        if not passages:
-            return AnswerResponse(
-                answer="Je n'ai trouvé aucune information pertinente dans les documents disponibles pour répondre à votre question.",
-                sources=[]
-            )
+        # 4. Prompt système strict avec consignes anti-hallucination formelles
+        prompt = f"""Tu es un assistant bancaire officiel de la BANCOBU.
+Tu dois répondre exclusivement à partir des extraits des documents bancaires officiels fournis dans le contexte ci-dessous.
+N'utilise aucune connaissance extérieure pour compléter une réponse.
+Si les extraits ne contiennent pas explicitement l'information demandée, réponds exactement :
+« {STRICT_FALLBACK_TEXT} »
+N'invente aucun tarif, aucune condition, aucun délai, aucun document requis et aucune caractéristique de produit bancaire.
+À la fin de ta réponse, mentionne obligatoirement la référence sous la forme : "Source : Page X".
 
-        # 3. Synthèse concise et rapide par Gemini
-        prompt = f"""
-Tu es un conseiller bancaire de haut niveau pour BANCOBU.
-Réponds à la question de manière claire, concise et professionnelle (2 à 3 paragraphes courts ou puces).
-Utilise fidèlement les extraits officiels ci-dessous. N'invente rien. Mentionne la page consultée à la fin.
-
-QUESTION DE L'UTILISATEUR :
-{question}
-
-INFORMATIONS DOCUMENTAIRES BANCOBU :
+INFORMATIONS DOCUMENTAIRES OFFICIELLES BANCOBU :
 {context}
 
-RÉPONSE DU CONSEILLER :
-"""
+QUESTION DU CLIENT :
+{question}
 
-        answer_text = generate_with_fallback(gemini, prompt)
+RÉPONSE DU CONSEILLER BANCAIRE :"""
+
+        answer_text = generate_answer_ollama(prompt)
 
         return AnswerResponse(
             answer=answer_text,
@@ -202,49 +286,16 @@ RÉPONSE DU CONSEILLER :
         )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/tts")
-async def generate_speech(payload: TTSRequest):
-    """Génère un flux audio MP3 naturel en français à partir du texte."""
-    text = payload.text.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Texte manquant pour la synthèse vocale.")
-
-    # Nettoyage du markdown pour une diction fluide et naturelle
-    clean_text = re.sub(r'[*#_`>~]', '', text)
-    clean_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean_text)
-    clean_text = re.sub(r'http\S+', '', clean_text)
-    clean_text = re.sub(r'\n+', '. ', clean_text).strip()
-
-    # Si le texte est très long, on synthétise les premiers paragraphes clés
-    if len(clean_text) > 800:
-        clean_text = clean_text[:800] + "..."
-
-    try:
-        temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        temp_audio.close()
-
-        selected_voice = payload.voice if payload.voice else VOICE_NAME
-        communicate = edge_tts.Communicate(clean_text, selected_voice)
-        await communicate.save(temp_audio.name)
-
-        return FileResponse(
-            temp_audio.name, 
-            media_type="audio/mpeg", 
-            filename="response.mp3"
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur TTS: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erreur interne RAG : {str(e)}")
 
 @app.post("/api/call/answer")
 def call_answer(payload: CallRequest):
-    """Réponse orale optimisée pour un appel téléphonique en direct avec le conseiller BANCOBU."""
+    """Réponse orale synthétique, naturelle et vérifiée pour le mode appel direct."""
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="La question ne peut pas être vide.")
 
-    # Salutations orales immédiates (< 10ms)
+    # Salutation orale immédiate
     clean_q = re.sub(r'[^\w\s]', '', question.lower()).strip()
     if clean_q in GREETINGS:
         return {
@@ -253,90 +304,217 @@ def call_answer(payload: CallRequest):
         }
 
     try:
-        gemini = get_gemini()
-        # 1. Embedding
-        embed_resp = gemini.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=question,
-            config={"output_dimensionality": 768}
-        )
-        query_vector = embed_resp.embeddings[0].values
+        search_query = normalize_banking_query(question)
+        query_vector = get_embedding(search_query)
+        passages = search_documents(query_vector, limit=TOP_K)
 
-        # 2. Recherche vectorielle dans Qdrant
-        client_qdrant = get_qdrant()
-        results = client_qdrant.query_points(
-            collection_name=COLLECTION_NAME,
-            query=query_vector,
-            limit=TOP_K,
-            with_payload=True
-        )
+        # Contrôle de pertinence documentaire
+        if not passages or passages[0].score < SCORE_THRESHOLD:
+            return {
+                "answer": "Cette information n'est pas précisée dans nos documents bancaires officiels actuels. Je vous invite à contacter votre agence BANCOBU la plus proche.",
+                "question": question
+            }
 
-        passages = results.points
+        relevant_passages = [p for p in passages if p.score >= SCORE_THRESHOLD]
+        if not relevant_passages:
+            return {
+                "answer": "Cette information n'est pas précisée dans nos documents bancaires officiels actuels. Je vous invite à contacter votre agence BANCOBU la plus proche.",
+                "question": question
+            }
+
         context = ""
-        for index, point in enumerate(passages, start=1):
+        for index, point in enumerate(relevant_passages, start=1):
             data = point.payload or {}
             chunk_text = str(data.get("text", ""))
             context += f"EXTRAIT {index} :\n{chunk_text}\n\n"
 
-        if not passages:
-            return {
-                "answer": "Je ne trouve malheureusement pas cette information dans nos documents bancaires actuels. Je vous invite à vous rapprocher de votre agence BANCOBU.",
-                "question": question
-            }
-
-        prompt = f"""Tu es un conseiller clientèle téléphonique professionnel et bienveillant de la banque BANCOBU au Burundi.
+        prompt = f"""Tu es un conseiller clientèle téléphonique professionnel de la banque BANCOBU au Burundi.
 Un client est en ligne au téléphone avec toi et te pose une question.
 
-CONSIGNES POUR L'APPEL TÉLÉPHONIQUE :
-1. Adopte un ton oral naturel, fluide, chaleureux et rassurant.
-2. Fais des phrases claires et agréables à écouter. Évite impérativement le formatage écrit : PAS de listes à puces avec astérisques (*), PAS de titres (#), PAS de tableaux.
-3. Reste concis (environ 2 à 4 phrases) : un client au téléphone souhaite une réponse directe et précise sans monologue interminable.
-4. Base-toi fidèlement sur les extraits documentaires fournis ci-dessous. N'invente rien.
-5. Si l'information est introuvable ou incomplète, indique-le aimablement au client.
+CONSIGNES STRICTES POUR L'APPEL TÉLÉPHONIQUE :
+1. Réponds exclusivement à partir des extraits des documents officiels fournis ci-dessous. N'utilise aucune connaissance extérieure.
+2. Si les extraits ne contiennent pas l'information demandée, dis aimablement au client que cette information n'est pas précisée dans nos documents officiels et invite-le à contacter son agence. N'invente rien.
+3. Adopte un ton oral naturel, fluide, chaleureux et courtois.
+4. Fais des phrases claires et agréables à écouter. Évite impérativement tout formatage écrit : PAS de listes à puces avec astérisques (*), PAS de titres (#), PAS de tableaux.
+5. Reste concis (2 à 4 phrases maximum) : le client au téléphone attend une réponse directe.
+
+INFORMATIONS DOCUMENTAIRES BANCOBU DISPONIBLES :
+{context}
 
 QUESTION DU CLIENT AU TÉLÉPHONE :
 {question}
 
-EXTRAITS DOCUMENTAIRES BANCOBU DISPONIBLES :
-{context}
+RÉPONSE ORALE DU CONSEILLER :"""
 
-Donne maintenant ta réponse orale directe au client :"""
-
-        answer_text = generate_with_fallback(gemini, prompt)
+        answer_text = generate_answer_ollama(prompt)
         clean_answer = re.sub(r'[*#_`]', '', answer_text).strip()
 
         return {
             "answer": clean_answer,
             "question": question
         }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Erreur appel vocal: {str(e)}")
+
+# ==============================================================================
+# ENDPOINTS AUDIO LOCAUX (PIPER TTS & WHISPER.CPP)
+# ==============================================================================
+
+@app.post("/api/tts")
+async def generate_speech(payload: TTSRequest):
+    """Synthèse vocale locale via Piper TTS (produit un flux audio WAV)."""
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Texte manquant pour la synthèse vocale.")
+
+    # Nettoyage du markdown pour une diction fluide
+    clean_text = re.sub(r'[*#_`>~]', '', text)
+    clean_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean_text)
+    clean_text = re.sub(r'http\S+', '', clean_text)
+    clean_text = re.sub(r'\n+', '. ', clean_text).strip()
+
+    if len(clean_text) > 800:
+        clean_text = clean_text[:800] + "..."
+
+    # Vérification de la présence de Piper TTS local
+    if not Path(PIPER_BIN_PATH).exists() or not Path(PIPER_MODEL_PATH).exists():
+        raise HTTPException(
+            status_code=503,
+            detail=f"Piper TTS n'est pas encore accessible sur ce système ({PIPER_BIN_PATH}). Disponible sur le Jetson."
+        )
+
+    temp_wav = None
+    try:
+        temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        temp_wav.close()
+
+        cmd = [
+            PIPER_BIN_PATH,
+            "--model", PIPER_MODEL_PATH,
+            "--output_file", temp_wav.name
+        ]
+        if Path(PIPER_CONFIG_PATH).exists():
+            cmd.extend(["--config", PIPER_CONFIG_PATH])
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(input=clean_text.encode("utf-8")),
+            timeout=25.0
+        )
+
+        if process.returncode != 0:
+            err_msg = stderr.decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(f"Erreur Piper CLI (code {process.returncode}): {err_msg}")
+
+        return FileResponse(
+            temp_wav.name,
+            media_type="audio/wav",
+            filename="response.wav"
+        )
+
+    except asyncio.TimeoutError:
+        if temp_wav and os.path.exists(temp_wav.name):
+            try: os.unlink(temp_wav.name)
+            except OSError: pass
+        raise HTTPException(status_code=504, detail="Délai dépassé lors de la synthèse vocale Piper (timeout 25s).")
+    except Exception as e:
+        if temp_wav and os.path.exists(temp_wav.name):
+            try: os.unlink(temp_wav.name)
+            except OSError: pass
+        raise HTTPException(status_code=500, detail=f"Erreur synthèse Piper: {str(e)}")
 
 @app.post("/api/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
-    """Transcrit fidèlement un fichier audio (micro voix) via Gemini Flash."""
+    """Transcription vocale locale via Whisper.cpp (accélération CUDA)."""
+    temp_in_path = None
+    temp_wav_path = None
     try:
         audio_bytes = await file.read()
         if not audio_bytes:
             raise HTTPException(status_code=400, detail="Fichier audio vide.")
 
-        content_type = file.content_type or "audio/webm"
-        mime = "audio/webm"
-        if "mp4" in content_type or "m4a" in content_type:
-            mime = "audio/mp4"
-        elif "wav" in content_type:
-            mime = "audio/wav"
-        elif "ogg" in content_type:
-            mime = "audio/ogg"
-        elif "mp3" in content_type or "mpeg" in content_type:
-            mime = "audio/mp3"
+        if not Path(WHISPER_CLI_PATH).exists() or not Path(WHISPER_MODEL_PATH).exists():
+            raise HTTPException(
+                status_code=503,
+                detail=f"Whisper.cpp n'est pas encore accessible sur ce système ({WHISPER_CLI_PATH}). Disponible sur le Jetson."
+            )
 
-        gemini = get_gemini()
-        audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime)
-        text = generate_with_fallback(gemini, [
-            audio_part,
-            "Tu es un transcripteur professionnel. Transcris fidèlement la parole en français contenue dans cet enregistrement audio. Ne retourne STRICTEMENT QUE les mots dits, sans guillemets, sans politesse et sans commentaire. Si aucun mot n'est prononcé, ne réponds rien."
-        ])
-        return {"transcript": text}
+        # 1. Sauvegarde sécurisée du fichier audio brut entrant
+        suffix = Path(file.filename or "audio.webm").suffix or ".webm"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_in:
+            temp_in.write(audio_bytes)
+            temp_in_path = temp_in.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_wav:
+            temp_wav_path = temp_wav.name
+
+        # 2. Conversion FFmpeg standardisée : WAV PCM 16-bit mono 16 kHz
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-i", temp_in_path,
+            "-ar", "16000",
+            "-ac", "1",
+            "-c:a", "pcm_s16le",
+            temp_wav_path
+        ]
+
+        conv_proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        conv_out, conv_err = await asyncio.wait_for(conv_proc.communicate(), timeout=15.0)
+
+        if conv_proc.returncode != 0:
+            err_details = conv_err.decode(errors="ignore").strip()
+            raise RuntimeError(f"Erreur de conversion audio FFmpeg (code {conv_proc.returncode}): {err_details}")
+
+        # 3. Exécution Whisper.cpp CLI avec séparation stricte des sorties et flag -np
+        whisper_cmd = [
+            WHISPER_CLI_PATH,
+            "-m", WHISPER_MODEL_PATH,
+            "-f", temp_wav_path,
+            "-l", "fr",
+            "-nt",  # Pas de timestamps
+            "-np"   # Pas de prints techniques/statistiques
+        ]
+
+        wh_proc = await asyncio.create_subprocess_exec(
+            *whisper_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        wh_out, wh_err = await asyncio.wait_for(wh_proc.communicate(), timeout=25.0)
+
+        if wh_proc.returncode != 0:
+            err_wh = wh_err.decode(errors="ignore").strip()
+            raise RuntimeError(f"Erreur Whisper-cli (code {wh_proc.returncode}): {err_wh}")
+
+        # 4. Nettoyage strict de la transcription
+        raw_output = wh_out.decode("utf-8", errors="ignore")
+        lines = [
+            line.strip() for line in raw_output.split("\n")
+            if line.strip() and not line.strip().startswith("read_audio_data:") and not line.strip().startswith("whisper_")
+        ]
+        clean_transcript = " ".join(lines).strip()
+
+        return {"transcript": clean_transcript}
+
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Délai d'attente dépassé lors du traitement audio (timeout).")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur transcription: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erreur transcription Whisper: {str(e)}")
+    finally:
+        # Nettoyage systématique garanti de tous les fichiers temporaires
+        if temp_in_path and os.path.exists(temp_in_path):
+            try: os.unlink(temp_in_path)
+            except OSError: pass
+        if temp_wav_path and os.path.exists(temp_wav_path):
+            try: os.unlink(temp_wav_path)
+            except OSError: pass

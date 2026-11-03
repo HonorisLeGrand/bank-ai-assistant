@@ -1,0 +1,447 @@
+import os
+import sys
+import re
+import tempfile
+import asyncio
+import subprocess
+from pathlib import Path
+from typing import List, Optional
+
+from fastapi import FastAPI, HTTPException, Response, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import ollama
+from qdrant_client import QdrantClient
+
+# ==============================================================================
+# CONFIGURATION LOCALE (NVIDIA JETSON ORIN NANO / ARCHITECTURE LOCALE)
+# ==============================================================================
+
+load_dotenv()
+
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "embeddinggemma")
+
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "bancobu_documents_ollama")
+QDRANT_PATH = os.getenv("QDRANT_PATH", "./qdrant_data")
+TOP_K = int(os.getenv("TOP_K", "3"))
+
+WHISPER_CLI_PATH = os.getenv("WHISPER_CLI_PATH", "/mnt/usb/whisper/whisper.cpp/build/bin/whisper-cli")
+WHISPER_MODEL_PATH = os.getenv("WHISPER_MODEL_PATH", "/mnt/usb/whisper-models/ggml-small.bin")
+
+PIPER_BIN_PATH = os.getenv("PIPER_BIN_PATH", "/mnt/usb/piper/venv/bin/piper")
+PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "/mnt/usb/piper/models/fr_FR-siwis-medium.onnx")
+PIPER_CONFIG_PATH = os.getenv("PIPER_CONFIG_PATH", "/mnt/usb/piper/models/fr_FR-siwis-medium.onnx.json")
+
+GREETINGS = {"bonjour", "salut", "hello", "bonsoir", "coucou", "yo", "aide", "aidez moi", "bonjour bancobu"}
+
+# ==============================================================================
+# APPLICATION FASTAPI
+# ==============================================================================
+
+app = FastAPI(
+    title="BANCOBU AI Assistant API (100% Local Jetson Orin Nano)",
+    version="2.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Clients locaux (initialisation paresseuse)
+ollama_client = None
+qdrant_client = None
+
+def get_ollama() -> ollama.Client:
+    global ollama_client
+    if ollama_client is None:
+        ollama_client = ollama.Client(host=OLLAMA_HOST)
+    return ollama_client
+
+def get_qdrant() -> QdrantClient:
+    global qdrant_client
+    if qdrant_client is None:
+        qdrant_client = QdrantClient(path=QDRANT_PATH)
+    return qdrant_client
+
+# ==============================================================================
+# SCHÉMAS PYDANTIC
+# ==============================================================================
+
+class QuestionRequest(BaseModel):
+    question: str
+
+class SourceItem(BaseModel):
+    source: str
+    page: int
+    text: str
+
+class AnswerResponse(BaseModel):
+    answer: str
+    sources: List[SourceItem]
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: Optional[str] = "siwis"
+
+class CallRequest(BaseModel):
+    question: str
+    voice: Optional[str] = "siwis"
+
+# ==============================================================================
+# FONCTIONS UTILITAIRES RAG (EMBEDDINGS & GÉNÉRATION OLLAMA)
+# ==============================================================================
+
+def get_embedding(text: str) -> List[float]:
+    """Calcule l'embedding local via Ollama (modèle EmbeddingGemma)."""
+    client = get_ollama()
+    response = client.embed(
+        model=EMBEDDING_MODEL,
+        input=text
+    )
+    return response["embeddings"][0]
+
+def generate_answer_ollama(prompt: str) -> str:
+    """Génère la réponse avec Qwen 2.5 3B local via Ollama."""
+    client = get_ollama()
+    response = client.generate(
+        model=LLM_MODEL,
+        prompt=prompt,
+        options={
+            "temperature": 0.2,
+            "top_p": 0.9,
+        }
+    )
+    return response.get("response", "").strip()
+
+def search_documents(query_vector: List[float], limit: int = TOP_K):
+    """Recherche les passages les plus pertinents dans Qdrant."""
+    client = get_qdrant()
+    results = client.query_points(
+        collection_name=COLLECTION_NAME,
+        query=query_vector,
+        limit=limit,
+        with_payload=True
+    )
+    return results.points
+
+# ==============================================================================
+# ENDPOINTS API
+# ==============================================================================
+
+@app.get("/api/health")
+def health():
+    """Diagnostic complet de l'état des composants locaux."""
+    ollama_ok = False
+    available_models = []
+    try:
+        client = get_ollama()
+        tags = client.list()
+        available_models = [m.model for m in tags.models] if hasattr(tags, 'models') else []
+        ollama_ok = True
+    except Exception as e:
+        available_models = [f"Erreur connexion Ollama: {str(e)}"]
+
+    qdrant_ok = False
+    points_count = 0
+    try:
+        q = get_qdrant()
+        info = q.get_collection(COLLECTION_NAME)
+        points_count = info.points_count
+        qdrant_ok = True
+    except Exception:
+        pass
+
+    whisper_present = Path(WHISPER_CLI_PATH).exists() and Path(WHISPER_MODEL_PATH).exists()
+    piper_present = Path(PIPER_BIN_PATH).exists() and Path(PIPER_MODEL_PATH).exists()
+
+    return {
+        "status": "ok" if (ollama_ok and qdrant_ok) else "degraded",
+        "architecture": "100% Local (NVIDIA Jetson Orin Nano)",
+        "ollama_host": OLLAMA_HOST,
+        "ollama_connected": ollama_ok,
+        "llm_model": LLM_MODEL,
+        "embedding_model": EMBEDDING_MODEL,
+        "collection": COLLECTION_NAME,
+        "collection_points": points_count,
+        "models_in_ollama": available_models,
+        "whisper_cli_ready": whisper_present,
+        "piper_tts_ready": piper_present
+    }
+
+@app.post("/api/ask", response_model=AnswerResponse)
+def ask_question(payload: QuestionRequest):
+    """Point d'entrée RAG complet : Question -> EmbeddingGemma -> Qdrant -> Qwen 2.5 3B."""
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="La question ne peut pas être vide.")
+
+    # 0. Réponse instantanée pour les salutations courantes (< 5ms)
+    clean_q = re.sub(r'[^\w\s]', '', question.lower()).strip()
+    if clean_q in GREETINGS:
+        return AnswerResponse(
+            answer="Bonjour et bienvenue à la **BANCOBU** ! Je suis votre conseiller bancaire intelligent.\n\nComment puis-je vous aider aujourd'hui ? Vous pouvez me poser toutes vos questions sur :\n* Nos **Comptes** (Courant, Épargne, Devise, Diaspora, KIRA MAMA...)\n* Nos **Cartes Bancaires** (Visa, eNoti...)\n* Nos offres de **Crédits et Facilités**\n\nPosez votre question à l'écrit ou directement à la voix !",
+            sources=[]
+        )
+
+    try:
+        # 1. Calcul de l'embedding de la question via EmbeddingGemma
+        query_vector = get_embedding(question)
+
+        # 2. Recherche des passages pertinents dans Qdrant
+        passages = search_documents(query_vector, limit=TOP_K)
+
+        sources_list = []
+        context = ""
+
+        for index, point in enumerate(passages, start=1):
+            data = point.payload or {}
+            source_file = str(data.get("source", "bancobu_donnees.pdf"))
+            page_num = int(data.get("page", 1))
+            chunk_text = str(data.get("text", ""))
+
+            sources_list.append(SourceItem(
+                source=source_file,
+                page=page_num,
+                text=chunk_text
+            ))
+
+            context += f"""
+EXTRAIT {index}
+Document : {source_file}
+Page : {page_num}
+
+Contenu :
+{chunk_text}
+"""
+
+        if not passages:
+            return AnswerResponse(
+                answer="Je n'ai trouvé aucune information pertinente dans les documents disponibles pour répondre à votre question.",
+                sources=[]
+            )
+
+        # 3. Synthèse par le LLM Qwen 2.5 3B local
+        prompt = f"""Tu es un conseiller bancaire de haut niveau pour la banque BANCOBU au Burundi.
+Réponds à la question posée de manière claire, concise et professionnelle (2 à 3 paragraphes courts ou puces).
+Utilise fidèlement et exclusivement les extraits officiels ci-dessous. N'invente aucune information.
+À la fin de ta réponse, mentionne toujours la ou les pages consultées sous la forme : "Source : Page X".
+
+INFORMATIONS DOCUMENTAIRES BANCOBU :
+{context}
+
+QUESTION DU CLIENT :
+{question}
+
+RÉPONSE DU CONSEILLER :"""
+
+        answer_text = generate_answer_ollama(prompt)
+
+        return AnswerResponse(
+            answer=answer_text,
+            sources=sources_list
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur interne RAG : {str(e)}")
+
+@app.post("/api/call/answer")
+def call_answer(payload: CallRequest):
+    """Réponse orale synthétique et naturelle pour le mode appel direct."""
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="La question ne peut pas être vide.")
+
+    # Salutation orale immédiate
+    clean_q = re.sub(r'[^\w\s]', '', question.lower()).strip()
+    if clean_q in GREETINGS:
+        return {
+            "answer": "Bonjour et bienvenue au service client de la BANCOBU ! Je suis votre conseiller bancaire virtuel. Comment puis-je vous renseigner aujourd'hui ?",
+            "question": question
+        }
+
+    try:
+        query_vector = get_embedding(question)
+        passages = search_documents(query_vector, limit=TOP_K)
+
+        context = ""
+        for index, point in enumerate(passages, start=1):
+            data = point.payload or {}
+            chunk_text = str(data.get("text", ""))
+            context += f"EXTRAIT {index} :\n{chunk_text}\n\n"
+
+        if not passages:
+            return {
+                "answer": "Je ne trouve malheureusement pas cette information dans nos documents bancaires actuels. Je vous invite à contacter votre agence BANCOBU la plus proche.",
+                "question": question
+            }
+
+        prompt = f"""Tu es un conseiller clientèle téléphonique de la banque BANCOBU au Burundi.
+Un client est en ligne au téléphone avec toi et te pose une question.
+
+CONSIGNES POUR L'APPEL TÉLÉPHONIQUE :
+1. Adopte un ton oral naturel, fluide, chaleureux et professionnel.
+2. Fais des phrases claires et agréables à écouter. Évite absolument tout formatage écrit : PAS de listes à puces avec astérisques (*), PAS de titres (#), PAS de tableaux.
+3. Reste concis (2 à 4 phrases maximum) : le client au téléphone attend une réponse rapide et directe.
+4. Base-toi fidèlement sur les extraits documentaires fournis. N'invente rien.
+
+INFORMATIONS DOCUMENTAIRES BANCOBU DISPONIBLES :
+{context}
+
+QUESTION DU CLIENT AU TÉLÉPHONE :
+{question}
+
+RÉPONSE ORALE DU CONSEILLER :"""
+
+        answer_text = generate_answer_ollama(prompt)
+        clean_answer = re.sub(r'[*#_`]', '', answer_text).strip()
+
+        return {
+            "answer": clean_answer,
+            "question": question
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur appel vocal: {str(e)}")
+
+# ==============================================================================
+# ENDPOINTS AUDIO LOCAUX (PIPER TTS & WHISPER.CPP)
+# ==============================================================================
+
+@app.post("/api/tts")
+async def generate_speech(payload: TTSRequest):
+    """Synthèse vocale locale via Piper TTS (produit un flux audio WAV)."""
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Texte manquant pour la synthèse vocale.")
+
+    # Nettoyage du markdown pour une diction fluide
+    clean_text = re.sub(r'[*#_`>~]', '', text)
+    clean_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean_text)
+    clean_text = re.sub(r'http\S+', '', clean_text)
+    clean_text = re.sub(r'\n+', '. ', clean_text).strip()
+
+    if len(clean_text) > 800:
+        clean_text = clean_text[:800] + "..."
+
+    # Vérification de la présence de Piper TTS local
+    if not Path(PIPER_BIN_PATH).exists() or not Path(PIPER_MODEL_PATH).exists():
+        raise HTTPException(
+            status_code=503,
+            detail=f"Piper TTS n'est pas encore accessible sur ce système ({PIPER_BIN_PATH}). Disponible lors du déploiement sur le Jetson."
+        )
+
+    try:
+        temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        temp_wav.close()
+
+        cmd = [
+            PIPER_BIN_PATH,
+            "--model", PIPER_MODEL_PATH,
+            "--output_file", temp_wav.name
+        ]
+        if Path(PIPER_CONFIG_PATH).exists():
+            cmd.extend(["--config", PIPER_CONFIG_PATH])
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate(input=clean_text.encode("utf-8"))
+
+        if process.returncode != 0:
+            err_msg = stderr.decode("utf-8", errors="ignore")
+            raise RuntimeError(f"Erreur Piper CLI: {err_msg}")
+
+        return FileResponse(
+            temp_wav.name,
+            media_type="audio/wav",
+            filename="response.wav"
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur synthèse Piper: {str(e)}")
+
+@app.post("/api/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """Transcription vocale locale via Whisper.cpp (accélération CUDA)."""
+    try:
+        audio_bytes = await file.read()
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="Fichier audio vide.")
+
+        if not Path(WHISPER_CLI_PATH).exists() or not Path(WHISPER_MODEL_PATH).exists():
+            raise HTTPException(
+                status_code=503,
+                detail=f"Whisper.cpp n'est pas encore accessible sur ce système ({WHISPER_CLI_PATH}). Disponible lors du déploiement sur le Jetson."
+            )
+
+        # Sauvegarde du fichier audio brut entrant
+        suffix = Path(file.filename or "audio.webm").suffix or ".webm"
+        temp_in = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        temp_in.write(audio_bytes)
+        temp_in.close()
+
+        # Conversion en WAV PCM 16kHz mono 16-bit pour Whisper.cpp
+        temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        temp_wav.close()
+
+        # Commande FFmpeg pour la conversion standardisée
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-i", temp_in.name,
+            "-ar", "16000",
+            "-ac", "1",
+            "-c:a", "pcm_s16le",
+            temp_wav.name
+        ]
+
+        conv_proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        _, conv_err = await conv_proc.communicate()
+
+        if conv_proc.returncode != 0:
+            raise RuntimeError(f"Erreur de conversion audio FFmpeg: {conv_err.decode(errors='ignore')}")
+
+        # Exécution de Whisper.cpp CLI
+        whisper_cmd = [
+            WHISPER_CLI_PATH,
+            "-m", WHISPER_MODEL_PATH,
+            "-f", temp_wav.name,
+            "-l", "fr",
+            "-nt"  # No timestamps
+        ]
+
+        wh_proc = await asyncio.create_subprocess_exec(
+            *whisper_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        wh_out, wh_err = await wh_proc.communicate()
+
+        # Nettoyage fichiers temporaires
+        try: os.unlink(temp_in.name)
+        except OSError: pass
+        try: os.unlink(temp_wav.name)
+        except OSError: pass
+
+        if wh_proc.returncode != 0:
+            raise RuntimeError(f"Erreur Whisper-cli: {wh_err.decode(errors='ignore')}")
+
+        transcribed_text = wh_out.decode("utf-8", errors="ignore").strip()
+        return {"transcript": transcribed_text}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur transcription Whisper: {str(e)}")

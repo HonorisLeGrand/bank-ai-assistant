@@ -1,20 +1,23 @@
 
+import os
 import hashlib
 import re
 from pathlib import Path
 
+from dotenv import load_dotenv
 import pymupdf
 import ollama
 
 from qdrant_client import QdrantClient, models
 
+load_dotenv()
 
 # CONFIGURATION
 PDF_PATH = Path("documents/bancobu_donnees.pdf")
-QDRANT_PATH = "./qdrant_data"
-COLLECTION_NAME = "bancobu_documents"
-
-OLLAMA_MODEL = "embeddinggemma"
+QDRANT_PATH = os.getenv("QDRANT_PATH", "./qdrant_data")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "bancobu_documents_ollama")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.getenv("EMBEDDING_MODEL", "embeddinggemma")
 
 CHUNK_SIZE = 1800
 CHUNK_OVERLAP = 250
@@ -135,8 +138,16 @@ def main():
     print("\n[3/4] Préparation de Qdrant...")
 
     client = QdrantClient(path=QDRANT_PATH)
+    client_ollama = ollama.Client(host=OLLAMA_HOST)
 
-    # On recrée uniquement notre collection pour éviter
+    # SÉCURITÉ ABSOLUE : interdiction d'écraser la collection d'origine bancobu_documents
+    if COLLECTION_NAME == "bancobu_documents":
+        raise PermissionError(
+            "RÈGLE DE SÉCURITÉ : La collection d'origine 'bancobu_documents' ne doit jamais être supprimée ou écrasée. "
+            "Utilisez une collection distincte comme 'bancobu_documents_ollama'."
+        )
+
+    # On recrée uniquement la collection dédiée pour éviter
     # de conserver d'anciens chunks lors d'une réindexation.
     if client.collection_exists(COLLECTION_NAME):
         client.delete_collection(COLLECTION_NAME)
@@ -145,7 +156,7 @@ def main():
     print("\n[4/4] Génération des embeddings...")
 
     first_batch = documents[:BATCH_SIZE]
-    first_response = ollama.embed(
+    first_response = client_ollama.embed(
         model=OLLAMA_MODEL,
         input=[doc["text"] for doc in first_batch]
     )
@@ -168,7 +179,7 @@ def main():
         if start == 0:
             embeddings = first_embeddings
         else:
-            response = ollama.embed(
+            response = client_ollama.embed(
                 model=OLLAMA_MODEL,
                 input=[doc["text"] for doc in batch]
             )

@@ -1,4 +1,4 @@
-#!/home/klauskira07/Projects/bank-ai-assistant/venv/bin/python3
+#!/home/honoris/Documents/ADASTRA/Projets/bank-ai-assistant/venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys
