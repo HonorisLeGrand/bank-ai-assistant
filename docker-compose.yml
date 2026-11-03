@@ -1,0 +1,17 @@
+services:
+  bancobu-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bancobu-ai-assistant
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-gemini-embedding-001}
+      - QDRANT_PATH=./qdrant_data
+      - COLLECTION_NAME=bancobu_documents
+    env_file:
+      - .env
