@@ -21,27 +21,28 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
 VOICE_NAME = "fr-FR-HenriNeural" # Voix masculine française chaleureuse et professionnelle
 
-# Modèles Gemini avec repli automatique en cas de 503 UNAVAILABLE ou 429
+# Modèles Gemini officiels avec repli automatique en cas de 503 UNAVAILABLE ou 429
 AVAILABLE_MODELS = [
-    "gemini-3.1-flash-lite", # Modèle ultra-rapide (< 2 secondes)
-    "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
-    "gemini-3.5-flash",
+    os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-2.0-flash-lite",
 ]
 
-def generate_with_fallback(gemini, contents):
+def generate_with_fallback(gemini, contents, config=None):
     """Génère du contenu avec repli automatique si un modèle subit une surcharge 503."""
     last_error = None
     seen_models = set()
     for model_name in AVAILABLE_MODELS:
-        if model_name in seen_models:
+        if not model_name or model_name in seen_models:
             continue
         seen_models.add(model_name)
         try:
-            res = gemini.models.generate_content(
-                model=model_name,
-                contents=contents
-            )
+            kwargs = {"model": model_name, "contents": contents}
+            if config:
+                kwargs["config"] = config
+            res = gemini.models.generate_content(**kwargs)
             if res and res.text:
                 return res.text.strip()
         except Exception as e:
@@ -100,8 +101,13 @@ class TTSRequest(BaseModel):
     text: str
     voice: Optional[str] = "fr-FR-DeniseNeural"
 
+class CallHistoryItem(BaseModel):
+    role: str # "user" ou "agent"
+    text: str
+
 class CallRequest(BaseModel):
     question: str
+    history: Optional[List[CallHistoryItem]] = []
     voice: Optional[str] = "fr-FR-DeniseNeural"
 
 @app.get("/api/health")
@@ -244,9 +250,12 @@ def call_answer(payload: CallRequest):
     if not question:
         raise HTTPException(status_code=400, detail="La question ne peut pas être vide.")
 
-    # Salutations orales immédiates (< 10ms)
+    # Vérification d'un historique d'appel existant
+    has_history = bool(payload.history and len(payload.history) > 0)
     clean_q = re.sub(r'[^\w\s]', '', question.lower()).strip()
-    if clean_q in GREETINGS:
+
+    # Si c'est une simple salutation isolée au TOUT DÉBUT de l'appel (sans aucun échange préalable)
+    if not has_history and clean_q in GREETINGS:
         return {
             "answer": "Bonjour et bienvenue au service client de la BANCOBU ! Je suis votre conseiller bancaire virtuel. Comment puis-je vous renseigner aujourd'hui ?",
             "question": question
@@ -280,29 +289,44 @@ def call_answer(payload: CallRequest):
 
         if not passages:
             return {
-                "answer": "Je ne trouve malheureusement pas cette information dans nos documents bancaires actuels. Je vous invite à vous rapprocher de votre agence BANCOBU.",
+                "answer": "Je n'ai pas cette information précise dans ma documentation actuelle. Je vous invite à vous rapprocher d'une agence BANCOBU.",
                 "question": question
             }
 
-        prompt = f"""Tu es un conseiller clientèle téléphonique professionnel et bienveillant de la banque BANCOBU au Burundi.
-Un client est en ligne au téléphone avec toi et te pose une question.
+        # Formater l'historique récent de la conversation téléphonique (derniers 4 échanges)
+        history_context = ""
+        if payload.history:
+            history_context = "HISTORIQUE RÉCENT DE CET APPEL :\n"
+            for item in payload.history[-4:]:
+                locuteur = "Client" if item.role == "user" else "Conseiller (Toi)"
+                history_context += f"- {locuteur} : {item.text}\n"
 
-CONSIGNES POUR L'APPEL TÉLÉPHONIQUE :
-1. Adopte un ton oral naturel, fluide, chaleureux et rassurant.
-2. Fais des phrases claires et agréables à écouter. Évite impérativement le formatage écrit : PAS de listes à puces avec astérisques (*), PAS de titres (#), PAS de tableaux.
-3. Reste concis (environ 2 à 4 phrases) : un client au téléphone souhaite une réponse directe et précise sans monologue interminable.
-4. Base-toi fidèlement sur les extraits documentaires fournis ci-dessous. N'invente rien.
-5. Si l'information est introuvable ou incomplète, indique-le aimablement au client.
+        prompt = f"""Tu es un conseiller clientèle téléphonique officiel de la banque BANCOBU au Burundi.
+Un client est en communication téléphonique en direct avec toi.
 
-QUESTION DU CLIENT AU TÉLÉPHONE :
-{question}
+CONSIGNES STRICTES DE FLUIDITÉ ORALE :
+1. L'appel est EN COURS et vous avez déjà salué le client. NE redis JAMAIS "Bonjour", "Bienvenue" ou toute formule d'accueil répétitive en cours d'appel. Va droit au but.
+2. Réponds de manière ultra fluide, directe et concise (1 à 2 phrases courtes maximum, environ 20 à 35 mots). Le client est au téléphone et attend une réponse rapide et naturelle.
+3. Prends impérativement en compte l'historique de la conversation ci-dessous pour assurer la continuité du dialogue (ex: si le client dit "Et combien ça coûte ?", réfère-toi au produit dont vous parliez juste avant).
+4. AUCUN formatage écrit : JAMAIS d'astérisques (*), JAMAIS de listes à puces, JAMAIS de titres (#). Parle comme au téléphone.
+5. Base-toi fidèlement sur les extraits documentaires BANCOBU ci-dessous. N'invente rien.
 
+{history_context}
 EXTRAITS DOCUMENTAIRES BANCOBU DISPONIBLES :
 {context}
 
-Donne maintenant ta réponse orale directe au client :"""
+DERNIÈRE QUESTION DU CLIENT :
+"{question}"
 
-        answer_text = generate_with_fallback(gemini, prompt)
+DONNE TA RÉPONSE ORALE DIRECTE, COURTE ET NATURELLE :"""
+
+        # Limitation de tokens pour une génération ultra rapide (< 400ms)
+        gen_config = types.GenerateContentConfig(
+            max_output_tokens=120,
+            temperature=0.3
+        )
+
+        answer_text = generate_with_fallback(gemini, prompt, config=gen_config)
         clean_answer = re.sub(r'[*#_`]', '', answer_text).strip()
 
         return {

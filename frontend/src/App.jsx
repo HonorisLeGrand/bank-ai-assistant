@@ -37,6 +37,9 @@ export default function App() {
   const callStatusRef = useRef('idle');
   const callRecognitionRef = useRef(null);
   const callIsMutedRef = useRef(false);
+  const isSubmittingRef = useRef(false);
+  const lastSpokenRef = useRef('');
+  const silenceTimerRef = useRef(null);
 
   const messagesEndRef = useRef(null);
   const recognitionRef = useRef(null);
@@ -80,6 +83,11 @@ export default function App() {
         recognition.onerror = (event) => {
           console.warn("SpeechRecognition avertissement:", event.error);
           setIsRecording(false);
+          // Si l'API vocale Google renvoie une erreur réseau ou de service, bascule fluide sur MediaRecorder + Gemini
+          if (event.error === 'network' || event.error === 'service-not-allowed') {
+            console.log("Bascule automatique vers la capture audio directe...");
+            startMediaRecording().catch(console.error);
+          }
         };
 
         recognition.onend = () => {
@@ -330,7 +338,13 @@ export default function App() {
     setCallHistory([]);
     setCallIsMuted(false);
     callIsMutedRef.current = false;
+    isSubmittingRef.current = false;
+    lastSpokenRef.current = '';
 
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
     if (callTimerRef.current) clearInterval(callTimerRef.current);
     callTimerRef.current = setInterval(() => {
       setCallDuration((prev) => prev + 1);
@@ -347,6 +361,9 @@ export default function App() {
     setCallHistory((prev) => [...prev, { role: 'agent', text }]);
 
     try {
+      if (callRecognitionRef.current) {
+        try { callRecognitionRef.current.abort(); } catch (e) {}
+      }
       const response = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -372,14 +389,34 @@ export default function App() {
         if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
           startCallListening();
         }
-      }, 2500);
+      }, 1500);
     }
+  };
+
+  const submitCallSpoken = (text) => {
+    const clean = (text || '').trim();
+    if (!clean || isSubmittingRef.current || callStatusRef.current !== 'connected') return;
+    isSubmittingRef.current = true;
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    if (callRecognitionRef.current) {
+      try { callRecognitionRef.current.abort(); } catch (e) {}
+    }
+    handleCallExchange(clean);
   };
 
   const startCallListening = () => {
     if (callStatusRef.current !== 'connected' || callIsMutedRef.current) return;
     setCallAgentState('listening');
     setCallUserSpoken('');
+    isSubmittingRef.current = false;
+    lastSpokenRef.current = '';
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (SpeechRecognition) {
@@ -403,32 +440,52 @@ export default function App() {
             }
           }
           const spoken = (finalTranscript || interimTranscript).trim();
-          if (spoken) setCallUserSpoken(spoken);
+          if (spoken) {
+            lastSpokenRef.current = spoken;
+            setCallUserSpoken(spoken);
+          }
 
           if (finalTranscript.trim()) {
-            recognition.stop();
-            handleCallExchange(finalTranscript.trim());
+            submitCallSpoken(finalTranscript.trim());
+          } else if (spoken.length > 2) {
+            // Détection automatique du silence naturel (850ms) pour une réactivité instantanée
+            if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+            silenceTimerRef.current = setTimeout(() => {
+              if (lastSpokenRef.current && !isSubmittingRef.current) {
+                submitCallSpoken(lastSpokenRef.current);
+              }
+            }, 850);
           }
         };
 
         recognition.onerror = (e) => {
           console.warn("Call speech error:", e.error);
-          if (e.error === 'no-speech' && callStatusRef.current === 'connected' && !callIsMutedRef.current) {
+          if (isSubmittingRef.current) return;
+          if (lastSpokenRef.current && lastSpokenRef.current.trim().length > 2) {
+            submitCallSpoken(lastSpokenRef.current.trim());
+            return;
+          }
+          if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
             setTimeout(() => {
-              if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
+              if (callStatusRef.current === 'connected' && !callIsMutedRef.current && !isSubmittingRef.current) {
                 startCallListening();
               }
-            }, 800);
+            }, 600);
           }
         };
 
         recognition.onend = () => {
+          if (isSubmittingRef.current) return;
+          if (lastSpokenRef.current && lastSpokenRef.current.trim().length > 2) {
+            submitCallSpoken(lastSpokenRef.current.trim());
+            return;
+          }
           if (callStatusRef.current === 'connected' && !callIsMutedRef.current && callAgentState === 'listening') {
             setTimeout(() => {
-              if (callStatusRef.current === 'connected' && !callIsMutedRef.current) {
-                try { recognition.start(); } catch (e) {}
+              if (callStatusRef.current === 'connected' && !callIsMutedRef.current && !isSubmittingRef.current) {
+                startCallListening();
               }
-            }, 500);
+            }, 300);
           }
         };
 
@@ -443,13 +500,20 @@ export default function App() {
   const handleCallExchange = async (question) => {
     if (!question || callStatusRef.current !== 'connected') return;
     setCallAgentState('thinking');
-    setCallHistory((prev) => [...prev, { role: 'user', text: question }]);
+    
+    // Contexte conversationnel : on enregistre immédiatement la question dans l'historique
+    const currentHistory = [...callHistory, { role: 'user', text: question }];
+    setCallHistory(currentHistory);
 
     try {
       const res = await fetch('/api/call/answer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, voice: callVoice })
+        body: JSON.stringify({ 
+          question, 
+          history: callHistory.slice(-6), 
+          voice: callVoice 
+        })
       });
       if (!res.ok) throw new Error("Erreur de réponse");
       const data = await res.json();
@@ -466,7 +530,13 @@ export default function App() {
     setCallAgentState('idle');
     setCallUserSpoken('');
     setCallAgentSpoken('');
+    isSubmittingRef.current = false;
+    lastSpokenRef.current = '';
 
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
     if (callTimerRef.current) {
       clearInterval(callTimerRef.current);
       callTimerRef.current = null;
