@@ -425,36 +425,28 @@ export default function App() {
           try { callRecognitionRef.current.abort(); } catch (e) {}
         }
         const recognition = new SpeechRecognition();
-        recognition.continuous = false;
+        recognition.continuous = true; // Permet à l'utilisateur de parler sans coupure prématurée
         recognition.interimResults = true;
         recognition.lang = 'fr-FR';
 
         recognition.onresult = (event) => {
-          let interimTranscript = '';
-          let finalTranscript = '';
-          for (let i = event.resultIndex; i < event.results.length; ++i) {
-            if (event.results[i].isFinal) {
-              finalTranscript += event.results[i][0].transcript;
-            } else {
-              interimTranscript += event.results[i][0].transcript;
-            }
+          let fullTranscript = '';
+          for (let i = 0; i < event.results.length; ++i) {
+            fullTranscript += event.results[i][0].transcript + ' ';
           }
-          const spoken = (finalTranscript || interimTranscript).trim();
+          const spoken = fullTranscript.trim();
           if (spoken) {
             lastSpokenRef.current = spoken;
             setCallUserSpoken(spoken);
-          }
 
-          if (finalTranscript.trim()) {
-            submitCallSpoken(finalTranscript.trim());
-          } else if (spoken.length > 2) {
-            // Détection automatique du silence naturel (850ms) pour une réactivité instantanée
+            // Réinitialiser le timer à chaque mot prononcé :
+            // On laisse 1.8 seconde de silence naturel complet pour laisser à l'utilisateur le temps de réfléchir et finir sa phrase
             if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
             silenceTimerRef.current = setTimeout(() => {
               if (lastSpokenRef.current && !isSubmittingRef.current) {
                 submitCallSpoken(lastSpokenRef.current);
               }
-            }, 850);
+            }, 1800);
           }
         };
 
