@@ -18,10 +18,19 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Installation de Nginx et curl (pour le Healthcheck)
+# Installation de Nginx et des outils de diagnostic réseau et système
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx \
     curl \
+    wget \
+    iputils-ping \
+    telnet \
+    netcat-openbsd \
+    dnsutils \
+    iproute2 \
+    net-tools \
+    procps \
+    nano \
     && rm -rf /var/lib/apt/lists/*
 
 # Installation des dépendances Python requises pour la version Online
